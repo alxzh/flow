@@ -418,6 +418,7 @@ const Process = struct {
     logger: log.Logger,
     receiver: Receiver,
     projects: ProjectsMap,
+    pending_vcs_ids: std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)) = .empty,
     non_indexed: []const []const u8,
     watch_non_indexed: bool,
     file_finder: ?[:0]const u8 = null,
@@ -459,6 +460,13 @@ const Process = struct {
             self.allocator.destroy(p.value_ptr.*);
         }
         self.projects.deinit(self.allocator);
+        var pending = self.pending_vcs_ids.iterator();
+        while (pending.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            for (entry.value_ptr.items) |path| self.allocator.free(path);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.pending_vcs_ids.deinit(self.allocator);
         for (self.non_indexed) |dir| self.allocator.free(dir);
         self.allocator.free(self.non_indexed);
         if (self.file_finder) |file_finder| self.allocator.free(file_finder);
@@ -540,16 +548,25 @@ const Process = struct {
                 project.walk_tree_done(self.parent.ref()) catch |e| return from.forward_error(e, @errorReturnTrace()) catch error.ClientFailed;
         } else if (try cbor.match(m.buf, .{ "git", tp.extract(&context), "rev_parse", tp.more })) {
             const request: *Project.VcsIdRequest = @ptrFromInt(context);
-            if (self.project_from_ref(request.project)) |project|
+            if (self.project_from_ref(request.project)) |project| {
                 project.process_git_response(self.parent.ref(), m) catch |e| self.logger.err("git-rev-parse", e);
+            } else if (try cbor.match(m.buf, .{ tp.any, tp.any, tp.any, tp.null_ })) {
+                request.deinit();
+            }
         } else if (try cbor.match(m.buf, .{ "git", tp.extract(&context), "cat_file", tp.more })) {
             const request: *Project.VcsContentRequest = @ptrFromInt(context);
-            if (self.project_from_ref(request.project)) |project|
+            if (self.project_from_ref(request.project)) |project| {
                 project.process_git_response(self.parent.ref(), m) catch |e| self.logger.err("git-cat-file", e);
+            } else if (try cbor.match(m.buf, .{ tp.any, tp.any, tp.any, tp.null_ })) {
+                request.deinit();
+            }
         } else if (try cbor.match(m.buf, .{ "git", tp.extract(&context), "blame", tp.more })) {
-            const request: *Project.GitBlameRequest = @ptrFromInt(context);
-            if (self.project_from_ref(request.project)) |project|
+            const request: *Project.VcsBlameRequest = @ptrFromInt(context);
+            if (self.project_from_ref(request.project)) |project| {
                 project.process_git_response(self.parent.ref(), m) catch |e| self.logger.err("git-blame", e);
+            } else if (try cbor.match(m.buf, .{ tp.any, tp.any, tp.any, tp.null_ })) {
+                request.deinit();
+            }
         } else if (try cbor.match(m.buf, .{ "git", tp.extract(&context), tp.more })) {
             const project: *Project = @ptrFromInt(context);
             project.process_git(self.parent.ref(), m) catch {};
@@ -820,6 +837,7 @@ const Process = struct {
             } else |e| self.logger.err("file_store", e);
             self.restore_project(project) catch |e| self.logger.err("restore_project", e);
             project.query_git();
+            self.drain_pending_vcs_ids(project_directory, project);
         }
     }
 
@@ -1008,18 +1026,49 @@ const Process = struct {
     }
 
     fn request_vcs_id(self: *Process, _: tp.pid_ref, project_directory: []const u8, file_path: []const u8) (ProjectError || Project.RequestError)!void {
-        const project = self.projects.get(project_directory) orelse return error.NoProject;
-        try project.request_vcs_id(file_path);
+        if (self.projects.get(project_directory)) |project|
+            return project.request_vcs_id(file_path);
+        try self.queue_vcs_id(project_directory, file_path);
+    }
+
+    fn queue_vcs_id(self: *Process, project_directory: []const u8, file_path: []const u8) error{OutOfMemory}!void {
+        if (self.pending_vcs_ids.getPtr(project_directory)) |paths| {
+            for (paths.items) |pending_path|
+                if (std.mem.eql(u8, pending_path, file_path)) return;
+            const owned_path = try self.allocator.dupe(u8, file_path);
+            errdefer self.allocator.free(owned_path);
+            return paths.append(self.allocator, owned_path);
+        }
+
+        const owned_project = try self.allocator.dupe(u8, project_directory);
+        errdefer self.allocator.free(owned_project);
+        const owned_path = try self.allocator.dupe(u8, file_path);
+        errdefer self.allocator.free(owned_path);
+        var paths: std.ArrayListUnmanaged([]const u8) = .empty;
+        errdefer paths.deinit(self.allocator);
+        try paths.append(self.allocator, owned_path);
+        try self.pending_vcs_ids.put(self.allocator, owned_project, paths);
+    }
+
+    fn drain_pending_vcs_ids(self: *Process, project_directory: []const u8, project: *Project) void {
+        const entry = self.pending_vcs_ids.fetchRemove(project_directory) orelse return;
+        defer self.allocator.free(entry.key);
+        var paths = entry.value;
+        defer paths.deinit(self.allocator);
+        for (paths.items) |file_path| {
+            project.request_vcs_id(file_path) catch {};
+            self.allocator.free(file_path);
+        }
     }
 
     fn request_vcs_content(self: *Process, _: tp.pid_ref, project_directory: []const u8, file_path: []const u8, vcs_id: []const u8) (ProjectError || Project.RequestError)!void {
         const project = self.projects.get(project_directory) orelse return error.NoProject;
-        try project.request_vcs_content(file_path, vcs_id);
+        try project.request_vcs_content(self.parent.ref(), file_path, vcs_id);
     }
 
     fn request_vcs_blame(self: *Process, _: tp.pid_ref, project_directory: []const u8, file_path: []const u8) (ProjectError || Project.RequestError)!void {
         const project = self.projects.get(project_directory) orelse return error.NoProject;
-        try project.request_vcs_blame(file_path);
+        try project.request_vcs_blame(self.parent.ref(), file_path);
     }
 
     fn did_open(self: *Process, project_directory: []const u8, file_path: []const u8, file_type: []const u8, language_server: []const u8, language_server_options: []const u8, language_server_protocol: file_type_config.ProtocolLevel, version: usize, text: []const u8) (ProjectError || Project.StartLspError || CallError || cbor.Error)!void {

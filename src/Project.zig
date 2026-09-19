@@ -65,6 +65,7 @@ state: struct {
 
 status: VcsStatus = .{},
 status_request: ?tp.pid = null,
+vcs_id_requests: std.StringHashMapUnmanaged(void) = .empty,
 load_complete: bool = false,
 
 const Self = @This();
@@ -194,6 +195,7 @@ pub fn deinit(self: *Self) void {
     self.lsp_commands.deinit(self.allocator);
     self.lsp_status_subscribers.deinit(self.allocator);
     self.status.reset(self.allocator);
+    self.vcs_id_requests.deinit(self.allocator);
     for (self.new_or_modified_files.items) |file| self.allocator.free(file.path);
     self.new_or_modified_files.deinit(self.allocator);
     for (self.files.items) |file| self.allocator.free(file.path);
@@ -1646,14 +1648,23 @@ fn process_status(self: *Self, parent: tp.pid_ref, m: tp.message) (OutOfMemoryEr
 }
 
 pub fn request_vcs_id(self: *Self, file_path: []const u8) error{OutOfMemory}!void {
+    if (self.vcs_id_requests.contains(file_path)) return;
     const request = try self.allocator.create(VcsIdRequest);
+    errdefer self.allocator.destroy(request);
+    const owned_path = try self.allocator.dupe(u8, file_path);
+    errdefer self.allocator.free(owned_path);
     request.* = .{
         .allocator = self.allocator,
         .project = @intFromPtr(self),
-        .file_path = try self.allocator.dupe(u8, file_path),
+        .file_path = owned_path,
     };
-    git.rev_parse(@intFromPtr(request), "HEAD", file_path) catch |e|
+    try self.vcs_id_requests.put(self.allocator, request.file_path, {});
+    errdefer _ = self.vcs_id_requests.remove(request.file_path);
+    git.rev_parse(@intFromPtr(request), "HEAD", file_path) catch |e| {
+        _ = self.vcs_id_requests.remove(request.file_path);
+        request.deinit();
         self.logger_git.print_err("rev-parse", "failed: {t}", .{e});
+    };
 }
 
 pub const VcsIdRequest = struct {
@@ -1667,16 +1678,24 @@ pub const VcsIdRequest = struct {
     }
 };
 
-pub fn request_vcs_content(self: *Self, file_path: []const u8, vcs_id: []const u8) error{OutOfMemory}!void {
+pub fn request_vcs_content(self: *Self, parent: tp.pid_ref, file_path: []const u8, vcs_id: []const u8) error{OutOfMemory}!void {
     const request = try self.allocator.create(VcsContentRequest);
+    errdefer self.allocator.destroy(request);
+    const owned_path = try self.allocator.dupe(u8, file_path);
+    errdefer self.allocator.free(owned_path);
+    const owned_id = try self.allocator.dupe(u8, vcs_id);
+    errdefer self.allocator.free(owned_id);
     request.* = .{
         .allocator = self.allocator,
         .project = @intFromPtr(self),
-        .file_path = try self.allocator.dupe(u8, file_path),
-        .vcs_id = try self.allocator.dupe(u8, vcs_id),
+        .file_path = owned_path,
+        .vcs_id = owned_id,
     };
-    git.cat_file(@intFromPtr(request), vcs_id) catch |e|
+    git.cat_file(@intFromPtr(request), vcs_id) catch |e| {
+        parent.send(.{ "PRJ", "vcs_content", request.file_path, request.vcs_id, null }) catch {};
+        request.deinit();
         self.logger_git.print_err("cat-file", "failed: {t}", .{e});
+    };
 }
 
 pub const VcsContentRequest = struct {
@@ -1698,13 +1717,12 @@ pub fn process_git_response(self: *Self, parent: tp.pid_ref, m: tp.message) (Out
     var vcs_content: []const u8 = undefined;
     var blame_output: []const u8 = undefined;
 
-    _ = self;
-
     if (try m.match(.{ tp.any, tp.extract(&context), "rev_parse", tp.extract(&vcs_id) })) {
         const request: *VcsIdRequest = @ptrFromInt(context);
         parent.send(.{ "PRJ", "vcs_id", request.file_path, vcs_id }) catch {};
     } else if (try m.match(.{ tp.any, tp.extract(&context), "rev_parse", tp.null_ })) {
         const request: *VcsIdRequest = @ptrFromInt(context);
+        _ = self.vcs_id_requests.remove(request.file_path);
         defer request.deinit();
     } else if (try m.match(.{ tp.any, tp.extract(&context), "cat_file", tp.extract(&vcs_content) })) {
         const request: *VcsContentRequest = @ptrFromInt(context);
@@ -1714,27 +1732,33 @@ pub fn process_git_response(self: *Self, parent: tp.pid_ref, m: tp.message) (Out
         defer request.deinit();
         parent.send(.{ "PRJ", "vcs_content", request.file_path, request.vcs_id, null }) catch {};
     } else if (try m.match(.{ tp.any, tp.extract(&context), "blame", tp.extract(&blame_output) })) {
-        const request: *GitBlameRequest = @ptrFromInt(context);
-        parent.send(.{ "PRJ", "git_blame", request.file_path, blame_output }) catch {};
+        const request: *VcsBlameRequest = @ptrFromInt(context);
+        parent.send(.{ "PRJ", "vcs_blame", request.file_path, blame_output }) catch {};
     } else if (try m.match(.{ tp.any, tp.extract(&context), "blame", tp.null_ })) {
-        const request: *GitBlameRequest = @ptrFromInt(context);
+        const request: *VcsBlameRequest = @ptrFromInt(context);
         defer request.deinit();
-        parent.send(.{ "PRJ", "git_blame", request.file_path, null }) catch {};
+        parent.send(.{ "PRJ", "vcs_blame", request.file_path, null }) catch {};
     }
 }
 
-pub fn request_vcs_blame(self: *Self, file_path: []const u8) error{OutOfMemory}!void {
-    const request = try self.allocator.create(GitBlameRequest);
+pub fn request_vcs_blame(self: *Self, parent: tp.pid_ref, file_path: []const u8) error{OutOfMemory}!void {
+    const request = try self.allocator.create(VcsBlameRequest);
+    errdefer self.allocator.destroy(request);
+    const owned_path = try self.allocator.dupe(u8, file_path);
+    errdefer self.allocator.free(owned_path);
     request.* = .{
         .allocator = self.allocator,
         .project = @intFromPtr(self),
-        .file_path = try self.allocator.dupe(u8, file_path),
+        .file_path = owned_path,
     };
-    git.blame(@intFromPtr(request), file_path) catch |e|
+    git.blame(@intFromPtr(request), file_path) catch |e| {
+        parent.send(.{ "PRJ", "vcs_blame", request.file_path, null }) catch {};
+        request.deinit();
         self.logger_git.print_err("blame", "failed: {t}", .{e});
+    };
 }
 
-pub const GitBlameRequest = struct {
+pub const VcsBlameRequest = struct {
     allocator: std.mem.Allocator,
     project: usize,
     file_path: []const u8,

@@ -719,7 +719,7 @@ fn receive_safe(self: *Self, from: tp.pid_ref, m: tp.message) !void {
     if (try m.match(.{ "PRJ", "vcs_content", tp.more }))
         return if (mainview()) |mv| mv.vcs_content_update(m);
 
-    if (try m.match(.{ "PRJ", "git_blame", tp.more })) {
+    if (try m.match(.{ "PRJ", "vcs_blame", tp.more })) {
         return if (mainview()) |mv| mv.vcs_blame_update(m);
     }
 
@@ -1895,7 +1895,7 @@ const cmds = struct {
     pub fn show_vcs_status(self: *Self, ctx: Ctx) Result {
         return self.enter_overlay_mode(@import("mode/overlay/vcs_status.zig").Type, ctx);
     }
-    pub const show_vcs_status_meta: Meta = .{ .description = "Show git status" };
+    pub const show_vcs_status_meta: Meta = .{ .description = "Show VCS status" };
 
     pub fn open_recent_project(_: *Self, _: Ctx) Result {
         try project_manager.request_recent_projects();

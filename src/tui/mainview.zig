@@ -2774,9 +2774,11 @@ fn extract_state(self: *Self, iter: *[]const u8, mode: enum { no_project, with_p
 }
 
 fn send_buffer_did_open(buffer: *Buffer) !void {
+    if (!buffer.is_ephemeral())
+        project_manager.request_vcs_id(buffer.get_file_path()) catch {};
+
     const ft = try file_type_config.get(buffer.file_type_name orelse return) orelse return;
     const content = buffer.store_to_string_cached(buffer.root, buffer.file_eol_mode);
-
     try project_manager.did_open(
         buffer.get_file_path(),
         ft,
@@ -2784,8 +2786,6 @@ fn send_buffer_did_open(buffer: *Buffer) !void {
         content,
         buffer.is_ephemeral(),
     );
-    if (!buffer.is_ephemeral())
-        project_manager.request_vcs_id(buffer.get_file_path()) catch {};
 }
 
 fn get_next_mru_buffer_for_view(self: *Self, view: usize, mode: enum { all, hidden, non_hidden }) ?[]const u8 {
@@ -3081,9 +3081,21 @@ pub fn vcs_id_update(self: *Self, m: tp.message) void {
     if (m.match(.{ "PRJ", "vcs_id", tp.extract(&file_path), tp.extract(&vcs_id) }) catch return) {
         const buffer = self.buffer_manager.get_buffer_for_file(file_path) orelse return;
         const vcs_id_updated = buffer.set_vcs_id(vcs_id) catch false;
-        if (vcs_id_updated) {
-            project_manager.request_vcs_content(file_path, vcs_id) catch {};
-            project_manager.request_vcs_blame(file_path) catch {};
+        // Buffer state persists the id, not the baseline bytes. Re-fetch when
+        // restoring such a buffer, while keeping each data stream single-flight.
+        if (vcs_id_updated or (buffer.get_vcs_content() == null and !buffer.vcs_content_pending)) {
+            if (!vcs_id_updated) {
+                buffer.clear_vcs_content();
+                buffer.clear_vcs_blame();
+            }
+            buffer.vcs_content_pending = true;
+            project_manager.request_vcs_content(file_path, vcs_id) catch {
+                buffer.vcs_content_pending = false;
+            };
+            buffer.vcs_blame_pending = true;
+            project_manager.request_vcs_blame(file_path) catch {
+                buffer.vcs_blame_pending = false;
+            };
         }
     }
 }
@@ -3098,6 +3110,7 @@ pub fn vcs_content_update(self: *Self, m: tp.message) void {
         buffer.set_vcs_content(vcs_id, content) catch {};
     } else if (m.match(.{ "PRJ", "vcs_content", tp.extract(&file_path), tp.extract(&vcs_id), tp.null_ }) catch return) {
         const buffer = self.buffer_manager.get_buffer_for_file(file_path) orelse return;
+        buffer.vcs_content_pending = false;
         if (self.get_editor_for_buffer(buffer)) |editor|
             editor.vcs_content_update() catch {};
     }
@@ -3106,11 +3119,12 @@ pub fn vcs_content_update(self: *Self, m: tp.message) void {
 pub fn vcs_blame_update(self: *Self, m: tp.message) void {
     var file_path: []const u8 = undefined;
     var blame_info: []const u8 = undefined;
-    if (m.match(.{ "PRJ", "git_blame", tp.extract(&file_path), tp.extract(&blame_info) }) catch return) {
+    if (m.match(.{ "PRJ", "vcs_blame", tp.extract(&file_path), tp.extract(&blame_info) }) catch return) {
         const buffer = self.buffer_manager.get_buffer_for_file(file_path) orelse return;
         buffer.set_vcs_blame(blame_info) catch {};
-    } else if (m.match(.{ "PRJ", "git_blame", tp.extract(&file_path), tp.null_ }) catch return) {
+    } else if (m.match(.{ "PRJ", "vcs_blame", tp.extract(&file_path), tp.null_ }) catch return) {
         const buffer = self.buffer_manager.get_buffer_for_file(file_path) orelse return;
+        buffer.vcs_blame_pending = false;
         buffer.parse_vcs_blame() catch return;
         if (self.get_editor_for_buffer(buffer)) |editor|
             editor.vcs_content_update() catch {};
