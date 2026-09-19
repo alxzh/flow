@@ -1153,12 +1153,12 @@ pub fn process_git_response(_: *Self, parent: tp.pid_ref, m: tp.message) (OutOfM
     var blame_output: []const u8 = undefined;
 
     if (try m.match(.{ tp.any, tp.extract(&context), "blame", tp.extract(&blame_output) })) {
-        const request: *GitBlameRequest = @ptrFromInt(context);
-        parent.send(.{ "PRJ", "git_blame", request.file_path, blame_output }) catch {};
+        const request: *VcsBlameRequest = @ptrFromInt(context);
+        parent.send(.{ "PRJ", "vcs_blame", request.file_path, blame_output }) catch {};
     } else if (try m.match(.{ tp.any, tp.extract(&context), "blame", tp.null_ })) {
-        const request: *GitBlameRequest = @ptrFromInt(context);
+        const request: *VcsBlameRequest = @ptrFromInt(context);
         defer request.deinit();
-        parent.send(.{ "PRJ", "git_blame", request.file_path, null }) catch {};
+        parent.send(.{ "PRJ", "vcs_blame", request.file_path, null }) catch {};
     }
 }
 
@@ -1172,20 +1172,26 @@ fn abs_path(self: *const Self, file_path: []const u8) error{OutOfMemory}![]const
     return std.fs.path.join(self.allocator, &.{ self.name, file_path });
 }
 
-pub fn request_vcs_blame(self: *Self, file_path: []const u8) error{OutOfMemory}!void {
-    const request = try self.allocator.create(GitBlameRequest);
+pub fn request_vcs_blame(self: *Self, parent: tp.pid_ref, file_path: []const u8) error{OutOfMemory}!void {
+    const request = try self.allocator.create(VcsBlameRequest);
+    errdefer self.allocator.destroy(request);
+    const owned_path = try self.allocator.dupe(u8, file_path);
+    errdefer self.allocator.free(owned_path);
     request.* = .{
         .allocator = self.allocator,
         .project = @intFromPtr(self),
-        .file_path = try self.allocator.dupe(u8, file_path),
+        .file_path = owned_path,
     };
     const path = try self.abs_path(file_path);
     defer self.allocator.free(path);
-    git.blame(@intFromPtr(request), path) catch |e|
+    git.blame(@intFromPtr(request), path) catch |e| {
+        parent.send(.{ "PRJ", "vcs_blame", request.file_path, null }) catch {};
+        request.deinit();
         self.logger_git.print_err("blame", "failed: {t}", .{e});
+    };
 }
 
-pub const GitBlameRequest = struct {
+pub const VcsBlameRequest = struct {
     allocator: std.mem.Allocator,
     project: usize,
     file_path: []const u8,

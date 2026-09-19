@@ -764,9 +764,12 @@ const Process = struct {
             const request: *Repo.VcsFirstChangeRequest = @ptrFromInt(context);
             self.process_repo_response(request.repo, m);
         } else if (try cbor.match(m.buf, .{ "git", tp.extract(&context), "blame", tp.more })) {
-            const request: *Project.GitBlameRequest = @ptrFromInt(context);
-            if (self.project_from_ref(request.project)) |project|
+            const request: *Project.VcsBlameRequest = @ptrFromInt(context);
+            if (self.project_from_ref(request.project)) |project| {
                 project.process_git_response(self.parent.ref(), m) catch |e| self.logger.err("git-blame", e);
+            } else if (try cbor.match(m.buf, .{ tp.any, tp.any, tp.any, tp.null_ })) {
+                request.deinit();
+            }
         } else if (try cbor.match(m.buf, .{ "git", tp.extract(&context), "status", tp.more })) {
             const repo: *Repo = @ptrFromInt(context);
             repo.process_status(self.parent.ref(), m) catch |e| self.logger.err("git-status", e);
@@ -1494,7 +1497,7 @@ const Process = struct {
 
     fn request_vcs_blame(self: *Process, _: tp.pid_ref, project_directory: []const u8, file_path: []const u8) (ProjectError || Project.RequestError)!void {
         const project = self.projects.get(project_directory) orelse return error.NoProject;
-        try project.request_vcs_blame(file_path);
+        try project.request_vcs_blame(self.parent.ref(), file_path);
     }
 
     fn did_open(self: *Process, project_directory: []const u8, file_path: []const u8, file_type: []const u8, language_server: []const u8, language_server_options: []const u8, language_server_settings: []const u8, language_server_protocol: file_type_config.ProtocolLevel, version: usize, hash: EditSet.Hash, text: []const u8) (ProjectError || Project.StartLspError || CallError || cbor.Error)!void {
