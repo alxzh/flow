@@ -9,7 +9,7 @@ const tp = @import("thespian");
 const cbor = @import("cbor");
 const log = @import("log");
 const root = @import("soft_root").root;
-const git = @import("git");
+const Vcs = @import("vcs");
 const file_watcher = @import("file_watcher");
 const gitignore = @import("gitignore");
 
@@ -20,7 +20,7 @@ const walk_tree = @import("walk_tree.zig");
 const module_name = @typeName(@This());
 
 /// How a finder lists the files of a project in a repository. The functions
-/// run on the finder's actor and reply to it the way git commands do:
+/// run on the finder's actor and reply to it the way VCS commands do:
 ///
 ///   {tag, context, "workspace_path", root: string or null}
 ///   {tag, context, "workspace_files", lines: string}       zero or more
@@ -32,17 +32,18 @@ const module_name = @typeName(@This());
 /// cannot disagree on it.
 pub const VcsLister = struct {
     tag: []const u8,
-    workspace_path: *const fn (context: usize, cwd: []const u8) git.Error!void,
-    workspace_files: *const fn (context: usize, cwd: []const u8) git.Error!void,
-    workspace_deleted_files: *const fn (context: usize, cwd: []const u8) git.Error!void,
+    workspace_path: *const fn (context: usize, cwd: []const u8) Vcs.Error!void,
+    workspace_files: *const fn (context: usize, cwd: []const u8) Vcs.Error!void,
+    workspace_deleted_files: *const fn (context: usize, cwd: []const u8) Vcs.Error!void,
     needs_full_stat: *const fn (cwd: []const u8) bool,
 
-    pub const git_lister: VcsLister = .{
-        .tag = git.module_name,
-        .workspace_path = git.workspace_path,
-        .workspace_files = git.workspace_files,
-        .workspace_deleted_files = git.workspace_deleted_files,
-        .needs_full_stat = git.workspace_files_need_full_stat,
+    /// The VCS of the project's directory, git or Mercurial.
+    pub const detected: VcsLister = .{
+        .tag = Vcs.module_name,
+        .workspace_path = Vcs.workspace_path,
+        .workspace_files = Vcs.workspace_files,
+        .workspace_deleted_files = Vcs.workspace_deleted_files,
+        .needs_full_stat = Vcs.workspace_files_need_full_stat,
     };
 
     /// No VCS: the finder walks the project tree.
@@ -54,8 +55,8 @@ pub const VcsLister = struct {
         .needs_full_stat = no_full_stat,
     };
 
-    fn not_found(_: usize, _: []const u8) git.Error!void {
-        return error.GitNotFound;
+    fn not_found(_: usize, _: []const u8) Vcs.Error!void {
+        return error.VcsNotFound;
     }
 
     fn no_full_stat(_: []const u8) bool {
@@ -77,9 +78,10 @@ pub const Options = struct {
     /// finder's lifetime. The process environment if null.
     environ_map: ?*const std.process.Environ.Map = null,
     /// Lists the files of a project in a repository. Test builds cannot
-    /// compile git, which finds its binary through the process environment
-    /// that they lack, so tests pass a lister of their own or get none.
-    vcs: VcsLister = if (builtin.is_test) .none else .git_lister,
+    /// compile the VCS backends, which find their binaries through the process
+    /// environment that they lack, so tests pass a lister of their own or get
+    /// none.
+    vcs: VcsLister = if (builtin.is_test) .none else .detected,
 };
 
 /// Spawn a finder for the project in `project_dir`. The calling actor
@@ -149,6 +151,7 @@ const Process = struct {
     }
 
     fn dtor(self: *Process) void {
+        Vcs.cancel_workspace_files(@intFromPtr(self));
         if (self.watcher) |*watcher| watcher.deinit();
         if (self.walker) |pid| {
             pid.send(.{"stop"}) catch {};
@@ -209,6 +212,7 @@ const Process = struct {
         var mtime_low: i64 = 0;
         var event_type: file_watcher.EventType = undefined;
         var object_type: file_watcher.ObjectType = undefined;
+        var context: usize = 0;
         var exit_code: i64 = 0;
         var watcher_error: []const u8 = undefined;
 
@@ -225,6 +229,10 @@ const Process = struct {
             self.handle_file_store_missing(path, stat_generation);
         } else if (try cbor.match(m.buf, .{ "FS", "stat_error", tp.extract(&stat_generation), tp.extract(&path), tp.string })) {
             self.handle_file_store_stat_error(path, stat_generation);
+        } else if (try cbor.match(m.buf, .{ self.vcs.tag, tp.extract(&context), "workspace_files_tracked", tp.more })) {
+            Vcs.handle_tracked_files(context, m);
+        } else if (try cbor.match(m.buf, .{ self.vcs.tag, tp.extract(&context), "workspace_files_unknown", tp.more })) {
+            Vcs.handle_unknown_files(context, m);
         } else if (try cbor.match(m.buf, .{ self.vcs.tag, tp.any, "workspace_files", tp.extract(&output) })) {
             self.add_workspace_files(output) catch |e| {
                 self.enumeration_failed = true;
@@ -295,7 +303,11 @@ const Process = struct {
             self.logger.print_err("vcs", "{s}: {f}", .{ self.root_path, m });
             switch (self.enumeration) {
                 .workspace_path => self.start_walker(),
-                .workspace_files, .workspace_deleted_files => self.enumeration_done(.none, false),
+                .workspace_files => {
+                    Vcs.cancel_workspace_files(@intFromPtr(self));
+                    self.enumeration_done(.none, false);
+                },
+                .workspace_deleted_files => self.enumeration_done(.none, false),
                 else => {},
             }
         }
@@ -923,9 +935,10 @@ test "recursive submodule listings require full stat validation" {
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const dir = try fixture(&tmp, &.{}, &buf);
-    try std.testing.expect(!git.workspace_files_need_full_stat(dir));
+    try tmp.dir.createDir(std.testing.io, ".git", .default_dir);
+    try std.testing.expect(!Vcs.workspace_files_need_full_stat(dir));
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".gitmodules", .data = "" });
-    try std.testing.expect(git.workspace_files_need_full_stat(dir));
+    try std.testing.expect(Vcs.workspace_files_need_full_stat(dir));
 }
 
 /// Indexes a tree, answers a request and a query, and reports the renames and
@@ -1305,12 +1318,12 @@ const FailedVcsSteps = struct {
 const failing_vcs: VcsLister = .{
     .tag = "failing_vcs",
     .workspace_path = struct {
-        fn call(_: usize, _: []const u8) git.Error!void {
+        fn call(_: usize, _: []const u8) Vcs.Error!void {
             const child = tp.spawn_link(test_allocator, {}, struct {
                 fn start(_: void) tp.result {
                     return tp.exit_error(error.VcsCommandFailed, null);
                 }
-            }.start, "failing_vcs") catch return error.GitCallFailed;
+            }.start, "failing_vcs") catch return error.VcsCallFailed;
             child.deinit();
         }
     }.call,
@@ -1328,22 +1341,22 @@ test "builtin finder falls back when a VCS command exits abnormally" {
 
 /// A VCS for tests, played by the actor registered as "test_vcs" in the
 /// environment that the finder was spawned with. It gets the calls, and
-/// replies to the finder with git's tag, as git commands would.
+/// replies to the finder with the VCS tag, as VCS commands would.
 const test_vcs: VcsLister = .{
-    .tag = git.module_name,
+    .tag = Vcs.module_name,
     .workspace_path = struct {
-        fn call(context: usize, cwd: []const u8) git.Error!void {
-            tp.env.get().proc("test_vcs").send(.{ "workspace_path", context, cwd }) catch return error.GitCallFailed;
+        fn call(context: usize, cwd: []const u8) Vcs.Error!void {
+            tp.env.get().proc("test_vcs").send(.{ "workspace_path", context, cwd }) catch return error.VcsCallFailed;
         }
     }.call,
     .workspace_files = struct {
-        fn call(context: usize, cwd: []const u8) git.Error!void {
-            tp.env.get().proc("test_vcs").send(.{ "workspace_files", context, cwd }) catch return error.GitCallFailed;
+        fn call(context: usize, cwd: []const u8) Vcs.Error!void {
+            tp.env.get().proc("test_vcs").send(.{ "workspace_files", context, cwd }) catch return error.VcsCallFailed;
         }
     }.call,
     .workspace_deleted_files = struct {
-        fn call(context: usize, cwd: []const u8) git.Error!void {
-            tp.env.get().proc("test_vcs").send(.{ "workspace_deleted_files", context, cwd }) catch return error.GitCallFailed;
+        fn call(context: usize, cwd: []const u8) Vcs.Error!void {
+            tp.env.get().proc("test_vcs").send(.{ "workspace_deleted_files", context, cwd }) catch return error.VcsCallFailed;
         }
     }.call,
     .needs_full_stat = VcsLister.no_full_stat,
@@ -1355,7 +1368,7 @@ const VcsSteps = struct {
     step: enum { listed, deletion_checked, listing_failed, no_repository } = .listed,
     walked: bool = false,
 
-    const tag = git.module_name;
+    const tag = Vcs.module_name;
 
     fn start(d: anytype) !void {
         // the finder gets a copy of this environment when it is spawned
