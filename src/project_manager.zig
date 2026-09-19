@@ -763,6 +763,20 @@ const Process = struct {
         } else if (try cbor.match(m.buf, .{ "vcs", tp.extract(&context), "first_change", tp.more })) {
             const request: *Repo.VcsFirstChangeRequest = @ptrFromInt(context);
             self.process_repo_response(request.repo, m);
+        } else if (try cbor.match(m.buf, .{ "vcs", tp.extract(&context), "blame_nodes", tp.more })) {
+            vcs.handle_blame_nodes(context, m);
+        } else if (try cbor.match(m.buf, .{ "vcs", tp.extract(&context), "blame_meta", tp.more })) {
+            vcs.handle_blame_meta(context, m);
+        } else if (try cbor.match(m.buf, .{ "vcs", tp.extract(&context), "status_files", tp.more })) {
+            vcs.handle_status_files(context, m);
+        } else if (try cbor.match(m.buf, .{ "vcs", tp.extract(&context), "status_shelves", tp.more })) {
+            vcs.handle_status_shelves(context, m);
+        } else if (try cbor.match(m.buf, .{ "vcs", tp.extract(&context), "status_branch", tp.more })) {
+            vcs.handle_status_branch(context, m);
+        } else if (try cbor.match(m.buf, .{ "vcs", tp.extract(&context), "workspace_files_tracked", tp.more })) {
+            vcs.handle_tracked_files(context, m);
+        } else if (try cbor.match(m.buf, .{ "vcs", tp.extract(&context), "workspace_files_unknown", tp.more })) {
+            vcs.handle_unknown_files(context, m);
         } else if (try cbor.match(m.buf, .{ "vcs", tp.extract(&context), "blame", tp.more })) {
             const request: *Project.VcsBlameRequest = @ptrFromInt(context);
             if (self.project_from_ref(request.project)) |project| {
@@ -1486,7 +1500,7 @@ const Process = struct {
         const args = request.args;
         const result = switch (args.kind) {
             .vcs_id => repo.request_vcs_id(request.abs_path, args.path),
-            .vcs_content => repo.request_vcs_content(args.path, args.vcs_id),
+            .vcs_content => repo.request_vcs_content(request.abs_path, args.path, args.vcs_id),
             .vcs_file_state => repo.request_vcs_file_state(request.to.ref(), args.id, request.abs_path),
         };
         result catch |e| {

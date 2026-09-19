@@ -422,12 +422,14 @@ fn add_vcs_status_file(self: *Self, xy: []const u8, sub: []const u8, path: []con
     };
 }
 
-/// git lists an untracked directory with a trailing separator
+/// A backend may list an untracked repository directory with a trailing separator.
 fn is_repo_dir(path: []const u8) bool {
     if (path.len == 0 or !std.fs.path.isSep(path[path.len - 1])) return false;
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const git_path = std.fmt.bufPrint(&buf, "{s}.git", .{path}) catch return false;
-    return is_directory(git_path) or soft_root.is_file(git_path);
+    const metadata = std.fmt.bufPrint(&buf, "{s}.git", .{path}) catch return false;
+    if (is_directory(metadata) or soft_root.is_file(metadata)) return true;
+    const hg_metadata = std.fmt.bufPrint(&buf, "{s}.hg", .{path}) catch return false;
+    return is_directory(hg_metadata);
 }
 
 /// git status paths are relative to the repository root
@@ -468,9 +470,9 @@ pub const VcsIdRequest = struct {
     }
 };
 
-pub fn request_vcs_content(self: *Self, file_path: []const u8, vcs_id: []const u8) vcs.Error!void {
+pub fn request_vcs_content(self: *Self, file_path_abs: []const u8, reply_path: []const u8, vcs_id: []const u8) vcs.Error!void {
     const request = try self.allocator.create(VcsContentRequest);
-    const owned_path = self.allocator.dupe(u8, file_path) catch |e| {
+    const owned_path = self.allocator.dupe(u8, reply_path) catch |e| {
         self.allocator.destroy(request);
         return e;
     };
@@ -485,7 +487,7 @@ pub fn request_vcs_content(self: *Self, file_path: []const u8, vcs_id: []const u
         .file_path = owned_path,
         .vcs_id = owned_id,
     };
-    vcs.file_content(@intFromPtr(request), self.root, file_path, vcs_id) catch |e| {
+    vcs.file_content(@intFromPtr(request), self.root, file_path_abs, vcs_id) catch |e| {
         request.deinit();
         self.logger_vcs.print_err("file-content", "failed: {t}", .{e});
         return e;
