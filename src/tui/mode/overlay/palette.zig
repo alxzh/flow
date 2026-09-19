@@ -227,7 +227,7 @@ pub fn Create(options: type) type {
 
         fn prepare_resize(self: *Self, padding: Widget.Style.Margin) Widget.Box {
             const screen = tui.screen();
-            const w = self.prepare_width(screen);
+            const w = self.prepare_width(screen, padding);
             return switch (self.placement) {
                 .top_center => self.prepare_resize_top_center(screen, w),
                 .top_left => self.prepare_resize_top_left(screen, w),
@@ -238,7 +238,15 @@ pub fn Create(options: type) type {
             };
         }
 
-        fn prepare_width(self: *Self, screen: Widget.Box) usize {
+        fn prepare_width(self: *Self, screen: Widget.Box, padding: Widget.Style.Margin) usize {
+            if (@hasDecl(options, "editor_viewport_width_percent")) {
+                const viewport_width = if (tui.mainview()) |mv|
+                    if (mv.get_active_editor()) |editor| editor.plane.dim_x() else screen.w
+                else
+                    screen.w;
+                const frame_width = viewport_width * options.editor_viewport_width_percent / 100;
+                return @min(screen.w, frame_width) -| padding.left -| padding.right;
+            }
             return @min(screen.w -| 2, @max(@min(self.longest + 3, max_menu_width) + 2 + self.longest_hint, options.label.len + 2));
         }
 
@@ -266,7 +274,7 @@ pub fn Create(options: type) type {
         }
 
         fn prepare_resize_top_right(self: *Self, screen: Widget.Box, w: usize, padding: Widget.Style.Margin) Widget.Box {
-            const x = if (screen.w > (w - padding.right)) (screen.w - w - padding.right) else 0;
+            const x = screen.w -| w -| padding.right;
             if (tui.mainview()) |mv| if (mv.is_view_centered()) {
                 const centered_view_width = tui.config().centered_view_width;
                 const right_edge = ((screen.w - centered_view_width) / 2) + centered_view_width;
@@ -348,6 +356,12 @@ pub fn Create(options: type) type {
             return h;
         }
 
+        fn item_capacity(self: *const Self) usize {
+            // Keep one item keyboard-selectable when the palette has room only
+            // for its input header (for example, in a one-row terminal).
+            return @max(self.view_rows, 1);
+        }
+
         fn on_scroll(self: *Self, _: tp.pid_ref, m: tp.message) error{Exit}!void {
             if (async_query) return;
             if (try m.match(.{ "scroll_to", tp.extract(&self.view_pos) })) {
@@ -375,7 +389,8 @@ pub fn Create(options: type) type {
         fn mouse_click_button5(menu: **Menu.State(*Self), _: *ButtonType, _: Widget.Pos) void {
             const self = &menu.*.opts.ctx.*;
             if (async_query) return;
-            if (self.view_pos < @max(self.total_items, self.view_rows) - self.view_rows)
+            const capacity = self.item_capacity();
+            if (self.view_pos < @max(self.total_items, capacity) - capacity)
                 self.view_pos += Menu.scroll_lines;
             self.update_scrollbar();
             self.start_query(0) catch {};
@@ -414,7 +429,12 @@ pub fn Create(options: type) type {
         }
 
         pub fn start_query(self: *Self, n: usize) !void {
-            if (async_query) return options.query(self, self.inputbox.text.items);
+            if (async_query) {
+                // Async palettes must lay out their input header before the
+                // first result arrives so typed queries render immediately.
+                self.refresh_layout();
+                return options.query(self, self.inputbox.text.items);
+            }
             defer tui.reset_hover(@src());
             defer self.update_count_hint();
             self.items = 0;
@@ -426,12 +446,13 @@ pub fn Create(options: type) type {
 
             if (self.inputbox.text.items.len == 0) {
                 self.total_items = 0;
+                const capacity = self.item_capacity();
                 var pos: usize = 0;
                 for (self.entries.items) |*entry| {
                     defer self.total_items += 1;
                     defer pos += 1;
                     if (pos < self.view_pos) continue;
-                    if (self.items < self.view_rows)
+                    if (self.items < capacity)
                         try options.add_menu_entry(self, entry, null);
                 }
             } else {
@@ -495,13 +516,14 @@ pub fn Create(options: type) type {
             }.less_fn;
             std.mem.sort(Match, matches.items, {}, less_fn);
 
+            const capacity = self.item_capacity();
             var pos: usize = 0;
             self.total_items = 0;
             for (matches.items) |*match| {
                 defer self.total_items += 1;
                 defer pos += 1;
                 if (pos < self.view_pos) continue;
-                if (self.items < self.view_rows)
+                if (self.items < capacity)
                     try options.add_menu_entry(self, match.entry, match.matches);
             }
             return matches.items.len;
@@ -561,12 +583,13 @@ pub fn Create(options: type) type {
         }
 
         fn select(self: *Self, idx: usize) void {
-            if (self.total_items < self.view_rows) {
+            const capacity = self.item_capacity();
+            if (self.total_items < capacity) {
                 self.view_pos = 0;
-            } else if (idx > self.total_items - self.view_rows) {
-                self.view_pos = self.total_items - self.view_rows;
-            } else if (idx > self.view_rows / 2) {
-                self.view_pos = idx - self.view_rows / 2;
+            } else if (idx > self.total_items - capacity) {
+                self.view_pos = self.total_items - capacity;
+            } else if (idx > capacity / 2) {
+                self.view_pos = idx - capacity / 2;
             } else {
                 self.view_pos = 0;
             }
@@ -585,8 +608,9 @@ pub fn Create(options: type) type {
 
             pub fn palette_menu_down(self: *Self, _: Ctx) Result {
                 if (!async_query) if (self.menu.selected) |selected| {
-                    if (selected == self.view_rows - 1 and
-                        self.view_pos + self.view_rows < self.total_items)
+                    const capacity = self.item_capacity();
+                    if (selected == capacity - 1 and
+                        self.view_pos + capacity < self.total_items)
                     {
                         self.view_pos += 1;
                         try self.start_query(0);
@@ -627,10 +651,11 @@ pub fn Create(options: type) type {
 
             pub fn palette_menu_pagedown(self: *Self, _: Ctx) Result {
                 if (!async_query) {
-                    if (self.total_items > self.view_rows) {
-                        self.view_pos += self.view_rows;
-                        if (self.view_pos > self.total_items - self.view_rows)
-                            self.view_pos = self.total_items - self.view_rows;
+                    const capacity = self.item_capacity();
+                    if (self.total_items > capacity) {
+                        self.view_pos += capacity;
+                        if (self.view_pos > self.total_items - capacity)
+                            self.view_pos = self.total_items - capacity;
                     }
                     try self.start_query(0);
                 }
@@ -641,8 +666,9 @@ pub fn Create(options: type) type {
 
             pub fn palette_menu_pageup(self: *Self, _: Ctx) Result {
                 if (!async_query) {
-                    if (self.view_pos > self.view_rows)
-                        self.view_pos -= self.view_rows
+                    const capacity = self.item_capacity();
+                    if (self.view_pos > capacity)
+                        self.view_pos -= capacity
                     else
                         self.view_pos = 0;
                     try self.start_query(0);
@@ -654,8 +680,9 @@ pub fn Create(options: type) type {
 
             pub fn palette_menu_bottom(self: *Self, _: Ctx) Result {
                 if (!async_query) {
-                    if (self.total_items > self.view_rows) {
-                        self.view_pos = self.total_items - self.view_rows;
+                    const capacity = self.item_capacity();
+                    if (self.total_items > capacity) {
+                        self.view_pos = self.total_items - capacity;
                     }
                     try self.start_query(0);
                 }
