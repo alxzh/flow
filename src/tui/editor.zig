@@ -798,9 +798,9 @@ pub const Editor = struct {
                     new_buf.is_ephemeral(),
                 ) catch |e|
                     self.logger.print("project_manager.did_open failed: {any}", .{e});
-                if (!new_buf.is_ephemeral())
-                    project_manager.request_vcs_id(file_path) catch {};
             };
+            if (buffer_meta == null and !new_buf.is_ephemeral())
+                project_manager.request_vcs_id(file_path) catch {};
             break :syntax syn;
         };
         self.syntax_no_render = tp.env.get().is("no-syntax");
