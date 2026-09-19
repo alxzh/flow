@@ -14,7 +14,7 @@ pub const Options = Matcher.Options;
 
 pub const per_directory_file_name = ".gitignore";
 
-const vcs_metadata_dirs = [_][]const u8{ ".git", ".jj" };
+const vcs_metadata_dirs = [_][]const u8{ ".git", ".hg", ".jj" };
 
 pub fn is_vcs_metadata_dir(name: []const u8) bool {
     for (vcs_metadata_dirs) |dir|
@@ -35,6 +35,9 @@ test "vcs metadata dirs" {
     try std.testing.expect(in_vcs_metadata_dir(".git/config"));
     try std.testing.expect(in_vcs_metadata_dir("sub/.git/refs/heads/main"));
     try std.testing.expect(in_vcs_metadata_dir(".jj/repo/store"));
+    try std.testing.expect(is_vcs_metadata_dir(".hg"));
+    try std.testing.expect(in_vcs_metadata_dir(".hg/store"));
+    try std.testing.expect(in_vcs_metadata_dir("sub/.hg/store/00changelog"));
     try std.testing.expect(!in_vcs_metadata_dir(".gitignore"));
     try std.testing.expect(!in_vcs_metadata_dir("src/git/main.zig"));
 }
