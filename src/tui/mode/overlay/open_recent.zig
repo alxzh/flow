@@ -14,6 +14,7 @@ pub const label = "Search files by name";
 pub const name = "󰈞 open recent";
 pub const description = "open recent";
 pub const icon = "󰈞  ";
+pub const editor_viewport_width_percent: usize = 80;
 
 const max_recent_files: usize = 25;
 

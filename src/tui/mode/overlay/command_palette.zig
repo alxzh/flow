@@ -10,6 +10,7 @@ pub const Type = @import("palette.zig").Create(@This());
 pub const label = "Search commands";
 pub const name = "󱊒 command";
 pub const description = "command";
+pub const editor_viewport_width_percent: usize = 80;
 
 pub const Entry = struct {
     label: []const u8,
