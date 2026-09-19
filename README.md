@@ -207,6 +207,44 @@ command. You can also create a new file type by adding a new `.conf` file
 to the `file_type` directory. Have a look at an existing file type to see
 what options are available.
 
+## External file finder
+
+By default, Find File searches Flow's project index. Set `file_finder` to an
+executable name or path to use an external file finder instead:
+
+```text
+file_finder "myles"
+```
+
+Flow runs the executable in the current project directory using this interface:
+
+```text
+<file-finder> --json --limit <maximum-results> --client flow -- <query>
+```
+
+The command must finish within 15 seconds, terminate promptly when sent
+`SIGTERM`, and write at most 8 MiB as one JSON object to stdout. Flow enforces
+the requested result limit and expects results in relevance order; output is
+displayed only after the command exits. `root`
+is an absolute path and defaults to the current project when omitted. `path`
+is relative to that root or an absolute path, and `matchIndexes` contains byte
+offsets into `path`:
+
+```json
+{
+  "root": "/absolute/repository/root",
+  "results": [
+    {"path": "relative/file.zig", "matchIndexes": [0, 1]}
+  ]
+}
+```
+
+An empty query still uses Flow's recent-file list. If the configured executable
+cannot be resolved when Flow starts, Flow logs the error once and uses its
+built-in index. Runtime failures produce an empty result set, and stderr is
+reserved for tool diagnostics. Configuration changes take effect after a
+restart. Set `file_finder` to `null` to use the built-in index for all queries.
+
 Logs, traces and per-project most recently used file lists are stored in
 the standard user application state directory. Usually
 `~/.local/state/flow` on Linux and %APPDATA%\Roaming\flow on Windows.

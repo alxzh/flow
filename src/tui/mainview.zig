@@ -1848,7 +1848,7 @@ const cmds = struct {
         if (try project_manager.request_most_recent_file(self.allocator)) |file_path|
             self.show_file_async(file_path);
     }
-    pub const open_most_recent_file_meta: Meta = .{ .description = "Open the last changed file" };
+    pub const open_most_recent_file_meta: Meta = .{ .description = "Open the most recently visited file" };
 
     pub fn restore_closed_tab(self: *Self, _: Ctx) Result {
         self.show_file_async(self.get_next_mru_buffer(.hidden) orelse return error.Stop);

@@ -70,6 +70,14 @@ var cache: CacheType = .empty;
 const CacheType = std.StringHashMapUnmanaged(?@This());
 var cache_list: []const []const u8 = &.{};
 
+const PathMatch = struct {
+    order: usize,
+    file_type: Self,
+};
+var path_match_mutex: std.Io.Mutex = .init;
+var path_match_cache: std.StringHashMapUnmanaged(PathMatch) = .empty;
+var path_match_cache_initialized = false;
+
 pub fn get(file_type_name: []const u8) !?@This() {
     const io = root.get_io();
     cache_mutex.lockUncancelable(io);
@@ -176,6 +184,37 @@ pub fn guess_file_type(file_path: ?[]const u8, content: []const u8) ?@This() {
     return guess(file_path, content);
 }
 
+pub fn guess_file_type_from_path(file_path: []const u8) ?@This() {
+    const io = root.get_io();
+    path_match_mutex.lockUncancelable(io);
+    defer path_match_mutex.unlock(io);
+
+    if (!path_match_cache_initialized) {
+        const names = get_all_names();
+        for (names, 0..) |file_type_name, order| {
+            const file_type = get(file_type_name) catch continue orelse continue;
+            for (file_type.extensions orelse continue) |path_match|
+                if (!path_match_cache.contains(path_match))
+                    path_match_cache.put(cache_allocator, path_match, .{
+                        .order = order,
+                        .file_type = file_type,
+                    }) catch return null;
+        }
+        path_match_cache_initialized = true;
+    }
+
+    const basename = std.fs.path.basename(file_path);
+    var best = path_match_cache.get(basename);
+    const file_extension = std.fs.path.extension(file_path);
+    if (file_extension.len > 1) {
+        if (path_match_cache.get(file_extension[1..])) |extension_match| {
+            if (best == null or extension_match.order < best.?.order)
+                best = extension_match;
+        }
+    }
+    return if (best) |match| match.file_type else null;
+}
+
 fn guess(file_path: ?[]const u8, content: []const u8) ?@This() {
     for (get_all_names()) |file_type_name| {
         const file_type = get(file_type_name) catch unreachable orelse unreachable;
@@ -186,6 +225,7 @@ fn guess(file_path: ?[]const u8, content: []const u8) ?@This() {
 }
 
 fn guess_first_line(content: []const u8) ?@This() {
+    if (content.len == 0) return null;
     const first_line = if (std.mem.indexOf(u8, content, "\n")) |pos| content[0..pos] else content;
     for (get_all_names()) |file_type_name| {
         const file_type = get(file_type_name) catch unreachable orelse unreachable;
@@ -258,3 +298,4 @@ fn vec(comptime args: anytype) []const []const u8 {
 const syntax = @import("syntax");
 const std = @import("std");
 const root = @import("soft_root").root;
+const Self = @This();
