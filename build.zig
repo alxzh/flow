@@ -1275,6 +1275,32 @@ pub fn build_exe(
         },
     });
 
+    const vcs_mod = b.createModule(.{
+        .root_source_file = b.path("src/vcs.zig"),
+        .imports = &.{
+            .{ .name = "git", .module = git_mod },
+        },
+    });
+
+    const git_test_run_cmd = blk: {
+        const tests = b.addTest(.{
+            .name = "test-git",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/git.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+            .filters = test_filters,
+        });
+        tests.root_module.addImport("thespian", thespian_mod);
+        tests.root_module.addImport("cbor", cbor_mod);
+        tests.root_module.addImport("shell", shell_mod);
+        tests.root_module.addImport("bin_path", bin_path_mod);
+        tests.root_module.addImport("soft_root", soft_root_mod);
+        if (install_tests) b.installArtifact(tests);
+        break :blk b.addRunArtifact(tests);
+    };
+
     const external_file_finder_test_run_cmd = blk: {
         const tests = b.addTest(.{
             .name = "test-external-file-finder",
@@ -1328,7 +1354,7 @@ pub fn build_exe(
             .{ .name = "lsp_config", .module = lsp_config_mod },
             .{ .name = "dizzy", .module = dizzy_dep.module("dizzy") },
             .{ .name = "fuzzig", .module = fuzzig_dep.module("fuzzig") },
-            .{ .name = "git", .module = git_mod },
+            .{ .name = "vcs", .module = vcs_mod },
             .{ .name = "VcsStatus", .module = VcsStatus_mod },
             .{ .name = "bin_path", .module = bin_path_mod },
             .{ .name = "file_watcher", .module = file_watcher_mod },
@@ -1602,6 +1628,7 @@ pub fn build_exe(
     test_step.dependOn(&double_mapped_ring_buffer_test_run_cmd.step);
     test_step.dependOn(&mouse_event_test_run_cmd.step);
     test_step.dependOn(&syntax_validator_test_run_cmd.step);
+    test_step.dependOn(&git_test_run_cmd.step);
     test_step.dependOn(&external_file_finder_test_run_cmd.step);
     if (stdio_capture_test_run_cmd) |cmd| test_step.dependOn(&cmd.step);
 

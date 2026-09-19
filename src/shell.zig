@@ -44,6 +44,7 @@ pub const Handlers = struct {
     exit: *const ExitHandler = log_exit_handler,
     log_execute: bool = true,
     line_buffered: bool = true,
+    stdout_delimiter: u8 = '\n',
 };
 
 pub fn execute(allocator: std.mem.Allocator, argv: tp.message, handlers: Handlers) Error!void {
@@ -227,9 +228,15 @@ const Process = struct {
         } else if (try m.match(.{"close"})) {
             self.close();
         } else if (try m.match(.{ module_name, "stdout", tp.extract(&bytes) })) {
-            self.handle_stdout(bytes) catch |e| return tp.exit_error(e, @errorReturnTrace());
+            self.handle_stdout(bytes) catch |e| {
+                self.handlers.exit(self.handlers.context, self.parent.ref(), self.arg0, @errorName(e), 1);
+                return tp.exit_error(e, @errorReturnTrace());
+            };
         } else if (try m.match(.{ module_name, "stderr", tp.extract(&bytes) })) {
-            self.handle_stderr(bytes) catch |e| return tp.exit_error(e, @errorReturnTrace());
+            self.handle_stderr(bytes) catch |e| {
+                self.handlers.exit(self.handlers.context, self.parent.ref(), self.arg0, @errorName(e), 1);
+                return tp.exit_error(e, @errorReturnTrace());
+            };
         } else if (try m.match(.{ module_name, "term", tp.more })) {
             defer self.sp = null;
             self.handle_terminated(m) catch |e| return tp.exit_error(e, @errorReturnTrace());
@@ -247,7 +254,12 @@ const Process = struct {
         return if (!self.handlers.line_buffered)
             self.handlers.out(self.handlers.context, self.parent.ref(), self.arg0, bytes)
         else
-            self.handle_buffered_output(self.handlers.out, &self.stdout_line_buffer, bytes);
+            self.handle_buffered_output(
+                self.handlers.out,
+                &self.stdout_line_buffer,
+                bytes,
+                self.handlers.stdout_delimiter,
+            );
     }
 
     fn handle_stderr(self: *Process, bytes: []const u8) error{OutOfMemory}!void {
@@ -255,20 +267,26 @@ const Process = struct {
         return if (!self.handlers.line_buffered)
             handler(self.handlers.context, self.parent.ref(), self.arg0, bytes)
         else
-            self.handle_buffered_output(handler, &self.stderr_line_buffer, bytes);
+            self.handle_buffered_output(handler, &self.stderr_line_buffer, bytes, '\n');
     }
 
-    fn handle_buffered_output(self: *Process, handler: *const OutputHandler, buffer: *std.ArrayListUnmanaged(u8), bytes: []const u8) error{OutOfMemory}!void {
-        var it = std.mem.splitScalar(u8, bytes, '\n');
-        var have_nl = false;
+    fn handle_buffered_output(
+        self: *Process,
+        handler: *const OutputHandler,
+        buffer: *std.ArrayListUnmanaged(u8),
+        bytes: []const u8,
+        delimiter: u8,
+    ) error{OutOfMemory}!void {
+        var it = std.mem.splitScalar(u8, bytes, delimiter);
+        var have_delimiter = false;
         var prev = it.first();
         while (it.next()) |next| {
-            have_nl = true;
+            have_delimiter = true;
             try buffer.appendSlice(self.allocator, prev);
-            try buffer.append(self.allocator, '\n');
+            try buffer.append(self.allocator, delimiter);
             prev = next;
         }
-        if (have_nl) {
+        if (have_delimiter) {
             handler(self.handlers.context, self.parent.ref(), self.arg0, buffer.items);
             buffer.clearRetainingCapacity();
         }
@@ -298,6 +316,7 @@ const Process = struct {
             self.handlers.exit(self.handlers.context, self.parent.ref(), self.arg0, "exited", 0);
         } else if (try m.match(.{ tp.any, tp.any, "error.FileNotFound", 1 })) {
             self.logger.print_err(self.arg0, "'{s}' executable not found", .{self.arg0});
+            self.handlers.exit(self.handlers.context, self.parent.ref(), self.arg0, "error.FileNotFound", 1);
         } else if (try m.match(.{ tp.any, tp.any, tp.extract(&err_msg), tp.extract(&exit_code) })) {
             self.handlers.exit(self.handlers.context, self.parent.ref(), self.arg0, err_msg, exit_code);
         }

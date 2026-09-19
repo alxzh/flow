@@ -60,8 +60,8 @@ fn on_click(self: *Self, _: *ButtonType, _: Widget.Pos) void {
     command.executeName("show_vcs_status", .empty()) catch {};
 }
 
-fn refresh_vcs_status(self: *Self) void {
-    if (self.status.branch) |_| project_manager.request_vcs_status() catch {};
+fn refresh_vcs_status(_: *Self) void {
+    project_manager.request_vcs_status() catch {};
 }
 
 pub fn receive(self: *Self, _: *ButtonType, _: tp.pid_ref, m: tp.message) error{Exit}!bool {
@@ -107,6 +107,8 @@ fn process_vcs_status(self: *Self, m: tp.message) MessageFilter.Error!bool {
     if (status.ahead) |ahead| self.status.ahead = try self.allocator.dupe(u8, ahead);
     if (status.behind) |behind| self.status.behind = try self.allocator.dupe(u8, behind);
     if (status.stash) |stash| self.status.stash = try self.allocator.dupe(u8, stash);
+    self.status.changed = status.changed;
+    self.status.untracked = status.untracked;
 
     return true;
 }

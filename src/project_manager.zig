@@ -423,6 +423,7 @@ const Process = struct {
     watch_non_indexed: bool,
     file_finder: ?[:0]const u8 = null,
     file_store: ?tp.pid = null,
+    next_project_context: usize = 1,
 
     const InvalidArgumentError = error{InvalidArgument};
     const UnsupportedError = error{Unsupported};
@@ -546,30 +547,30 @@ const Process = struct {
         } else if (try cbor.match(m.buf, .{ "walk_tree_done", tp.extract(&project_directory) })) {
             if (self.projects.get(project_directory)) |project|
                 project.walk_tree_done(self.parent.ref()) catch |e| return from.forward_error(e, @errorReturnTrace()) catch error.ClientFailed;
-        } else if (try cbor.match(m.buf, .{ "git", tp.extract(&context), "rev_parse", tp.more })) {
+        } else if (try cbor.match(m.buf, .{ "vcs", tp.extract(&context), "file_id", tp.more })) {
             const request: *Project.VcsIdRequest = @ptrFromInt(context);
             if (self.project_from_ref(request.project)) |project| {
-                project.process_git_response(self.parent.ref(), m) catch |e| self.logger.err("git-rev-parse", e);
+                project.process_vcs_response(self.parent.ref(), m) catch |e| self.logger.err("vcs-file-id", e);
             } else if (try cbor.match(m.buf, .{ tp.any, tp.any, tp.any, tp.null_ })) {
                 request.deinit();
             }
-        } else if (try cbor.match(m.buf, .{ "git", tp.extract(&context), "cat_file", tp.more })) {
+        } else if (try cbor.match(m.buf, .{ "vcs", tp.extract(&context), "file_content", tp.more })) {
             const request: *Project.VcsContentRequest = @ptrFromInt(context);
             if (self.project_from_ref(request.project)) |project| {
-                project.process_git_response(self.parent.ref(), m) catch |e| self.logger.err("git-cat-file", e);
+                project.process_vcs_response(self.parent.ref(), m) catch |e| self.logger.err("vcs-file-content", e);
             } else if (try cbor.match(m.buf, .{ tp.any, tp.any, tp.any, tp.null_ })) {
                 request.deinit();
             }
-        } else if (try cbor.match(m.buf, .{ "git", tp.extract(&context), "blame", tp.more })) {
+        } else if (try cbor.match(m.buf, .{ "vcs", tp.extract(&context), "blame", tp.more })) {
             const request: *Project.VcsBlameRequest = @ptrFromInt(context);
             if (self.project_from_ref(request.project)) |project| {
-                project.process_git_response(self.parent.ref(), m) catch |e| self.logger.err("git-blame", e);
+                project.process_vcs_response(self.parent.ref(), m) catch |e| self.logger.err("vcs-blame", e);
             } else if (try cbor.match(m.buf, .{ tp.any, tp.any, tp.any, tp.null_ })) {
                 request.deinit();
             }
-        } else if (try cbor.match(m.buf, .{ "git", tp.extract(&context), tp.more })) {
-            const project: *Project = @ptrFromInt(context);
-            project.process_git(self.parent.ref(), m) catch {};
+        } else if (try cbor.match(m.buf, .{ "vcs", tp.extract(&context), tp.more })) {
+            if (self.project_from_ref(context)) |project|
+                project.process_vcs(self.parent.ref(), m) catch {};
         } else if (try cbor.match(m.buf, .{ "update_mru", tp.extract(&project_directory), tp.extract(&source_location) })) {
             self.update_mru(project_directory, &source_location) catch |e| return from.forward_error(e, @errorReturnTrace()) catch error.ClientFailed;
         } else if (try cbor.match(m.buf, .{ "child", tp.extract(&project_directory), tp.extract(&language_server), "notify", tp.extract(&method), tp.extract_cbor(&params_cb) })) {
@@ -826,7 +827,10 @@ const Process = struct {
             else
                 self.logger.print("opening: {s}", .{project_directory});
             const project = try self.allocator.create(Project);
-            project.* = try Project.init(self.allocator, project_directory, self.parent.ref(), .{
+            const vcs_context = self.next_project_context;
+            self.next_project_context +%= 1;
+            if (self.next_project_context == 0) self.next_project_context = 1;
+            project.* = try Project.init(self.allocator, project_directory, vcs_context, self.parent.ref(), .{
                 .no_index = no_index,
                 .watch_non_indexed = self.watch_non_indexed,
                 .index_workspace_files = self.file_finder == null,
@@ -836,7 +840,7 @@ const Process = struct {
                 project.file_store = file_store.clone();
             } else |e| self.logger.err("file_store", e);
             self.restore_project(project) catch |e| self.logger.err("restore_project", e);
-            project.query_git();
+            project.query_vcs();
             self.drain_pending_vcs_ids(project_directory, project);
         }
     }
@@ -913,7 +917,7 @@ const Process = struct {
 
     fn request_sync_with_vcs(self: *Process, _: tp.pid_ref, project_directory: []const u8) (ProjectError || Project.RequestError)!void {
         const project = self.projects.get(project_directory) orelse return error.NoProject;
-        return project.query_git();
+        return project.query_vcs();
     }
 
     fn request_new_or_modified_files(self: *Process, from: tp.pid_ref, project_directory: []const u8, max: usize) (ProjectError || Project.RequestError)!void {
@@ -1321,7 +1325,7 @@ const Process = struct {
 
     fn project_from_ref(self: *const Process, project_ref: usize) ?*Project {
         var iter = self.projects.valueIterator();
-        while (iter.next()) |project| if (@intFromPtr(project.*) == project_ref)
+        while (iter.next()) |project| if (project.*.vcs_context == project_ref)
             return project.*;
         return null;
     }

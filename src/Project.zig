@@ -4,7 +4,7 @@ const cbor = @import("cbor");
 const log = @import("log");
 const root = @import("soft_root").root;
 const fuzzig = @import("fuzzig");
-const git = @import("git");
+const vcs = @import("vcs");
 const VcsStatus = @import("VcsStatus");
 const file_type_config = @import("file_type_config");
 const file_link = @import("file_link");
@@ -21,6 +21,7 @@ const convert_path = LSPClient.convert_path;
 
 allocator: std.mem.Allocator,
 name: []const u8,
+vcs_context: usize,
 files: std.ArrayListUnmanaged(File) = .empty,
 new_or_modified_files: std.ArrayListUnmanaged(FileVcsStatus) = .empty,
 pending: std.ArrayListUnmanaged(File) = .empty,
@@ -39,7 +40,7 @@ tasks: std.ArrayList(Task),
 persistent: bool = false,
 logger: log.Logger,
 logger_lsp: log.Logger,
-logger_git: log.Logger,
+logger_vcs: log.Logger,
 last_used: i128,
 parent: tp.pid,
 
@@ -84,7 +85,7 @@ pub const RequestError = error{
 } || OutOfMemoryError || cbor.Error;
 pub const StartLspError = LSPClient.StartLspError;
 pub const LspError = LSPClient.LspError;
-pub const GitError = error{InvalidGitResponse};
+pub const VcsError = error{InvalidVcsResponse};
 pub const LspInfoError = LSPClient.LspInfoError;
 
 const File = struct {
@@ -127,11 +128,12 @@ pub const Options = struct {
     index_workspace_files: bool = true,
 };
 
-pub fn init(allocator: std.mem.Allocator, name: []const u8, parent: tp.pid_ref, options: Options) OutOfMemoryError!Self {
+pub fn init(allocator: std.mem.Allocator, name: []const u8, vcs_context: usize, parent: tp.pid_ref, options: Options) OutOfMemoryError!Self {
     const now = root.get_now();
     return .{
         .allocator = allocator,
         .name = try allocator.dupe(u8, name),
+        .vcs_context = vcs_context,
         .no_index = options.no_index,
         .index_workspace_files = options.index_workspace_files,
         .open_time = now.toMilliseconds(),
@@ -140,7 +142,7 @@ pub fn init(allocator: std.mem.Allocator, name: []const u8, parent: tp.pid_ref, 
         .tasks = .empty,
         .logger = log.logger("project"),
         .logger_lsp = log.logger("lsp"),
-        .logger_git = log.logger("git"),
+        .logger_vcs = log.logger("vcs"),
         .last_used = @as(i128, now.toNanoseconds()),
         .parent = parent.clone(),
         .watcher = start_watcher(name, options),
@@ -207,7 +209,7 @@ pub fn deinit(self: *Self) void {
     for (self.tasks.items) |task| self.allocator.free(task.command);
     self.tasks.deinit(self.allocator);
     self.logger_lsp.deinit();
-    self.logger_git.deinit();
+    self.logger_vcs.deinit();
     self.logger.deinit();
     self.allocator.free(self.name);
 }
@@ -1107,7 +1109,11 @@ pub fn get_mru_position(self: *Self, from: tp.pid_ref, file_path: []const u8) Re
 
 pub fn request_vcs_status(self: *Self, from: tp.pid_ref) RequestError!void {
     switch (self.state.status) {
-        .failed => return,
+        .failed => {
+            if (self.workspace == null) return;
+            self.state.status = .done;
+            return self.request_vcs_status(from);
+        },
         .none => switch (self.state.workspace_path) {
             .running => {
                 if (self.status_request) |_| return;
@@ -1124,10 +1130,21 @@ pub fn request_vcs_status(self: *Self, from: tp.pid_ref) RequestError!void {
         .done => {
             if (self.status_request) |_| return;
             self.status_request = from.clone();
+            self.reset_vcs_status_counts();
+            // Refresh both legs so the branch and counters describe the same
+            // working-copy snapshot. Synchronous launch failures settle their
+            // leg and still produce a response through maybe_reply_vcs_status.
+            if (self.state.current_branch != .running) {
+                self.state.current_branch = .running;
+                vcs.current_branch(self.vcs_context, self.name) catch {
+                    self.state.current_branch = .failed;
+                };
+            }
             self.state.status = .running;
-            git.status(@intFromPtr(self)) catch {
+            vcs.status(self.vcs_context, self.name) catch {
                 self.state.status = .failed;
             };
+            self.maybe_reply_vcs_status();
         },
     }
     switch (self.state.vcs_new_or_modified_files) {
@@ -1135,12 +1152,48 @@ pub fn request_vcs_status(self: *Self, from: tp.pid_ref) RequestError!void {
             for (self.new_or_modified_files.items) |file| self.allocator.free(file.path);
             self.new_or_modified_files.clearRetainingCapacity();
             self.state.vcs_new_or_modified_files = .running;
-            git.new_or_modified_files(@intFromPtr(self)) catch {
+            vcs.new_or_modified_files(self.vcs_context, self.name) catch {
                 self.state.vcs_new_or_modified_files = .failed;
             };
         },
         else => {},
     }
+}
+
+fn reset_vcs_status_counts(self: *Self) void {
+    self.status.changed = 0;
+    self.status.untracked = 0;
+    if (self.status.ahead) |ahead| {
+        self.allocator.free(ahead);
+        self.status.ahead = null;
+    }
+    if (self.status.behind) |behind| {
+        self.allocator.free(behind);
+        self.status.behind = null;
+    }
+    if (self.status.stash) |stash| {
+        self.allocator.free(stash);
+        self.status.stash = null;
+    }
+}
+
+/// Reply to a parked status requester once both the branch and status legs
+/// have settled (done or failed). Never blocks: legs still running simply
+/// defer the reply to their completion handlers.
+fn maybe_reply_vcs_status(self: *Self) void {
+    if (self.status_request == null) return;
+    switch (self.state.status) {
+        .done, .failed => {},
+        .none, .running => return,
+    }
+    switch (self.state.current_branch) {
+        .done, .failed => {},
+        .none, .running => return,
+    }
+    const from = self.status_request.?;
+    self.status_request = null;
+    from.send(.{ "vcs_status", self.status }) catch {};
+    from.deinit();
 }
 
 pub fn request_tasks(self: *Self, from: tp.pid_ref) RequestError!void {
@@ -1438,17 +1491,19 @@ pub fn unsupported_lsp_request(self: *Self, from: tp.pid_ref, cbor_id: []const u
 
 pub const GetLineOfFileError = LSPClient.GetLineOfFileError;
 
-pub fn query_git(self: *Self) void {
+pub fn query_vcs(self: *Self) void {
     if (self.state.workspace_path == .running or self.state.workspace_files == .running) return;
     self.state.workspace_path = .running;
-    git.workspace_path(@intFromPtr(self)) catch {
+    vcs.workspace_path(self.vcs_context, self.name) catch {
         self.state.workspace_path = .failed;
+        self.state.status = .failed;
         self.start_walker();
     };
     self.state.current_branch = .running;
-    git.current_branch(@intFromPtr(self)) catch {
+    vcs.current_branch(self.vcs_context, self.name) catch {
         self.state.current_branch = .failed;
     };
+    self.maybe_reply_vcs_status();
     self.loaded(self.parent.ref()) catch {};
 }
 
@@ -1524,7 +1579,7 @@ pub fn ignore_subtree_removed(self: *Self, rel_path: []const u8) void {
     m.invalidate_subtree(rel_path);
 }
 
-pub fn process_git(self: *Self, parent: tp.pid_ref, m: tp.message) (OutOfMemoryError || error{Exit})!void {
+pub fn process_vcs(self: *Self, parent: tp.pid_ref, m: tp.message) (OutOfMemoryError || error{Exit})!void {
     var value: []const u8 = undefined;
     var path: []const u8 = undefined;
     var vcs_status: u8 = undefined;
@@ -1532,7 +1587,9 @@ pub fn process_git(self: *Self, parent: tp.pid_ref, m: tp.message) (OutOfMemoryE
         return self.process_status(parent, m);
     } else if (try m.match(.{ tp.any, tp.any, "workspace_path", tp.null_ })) {
         self.state.workspace_path = .done;
+        self.state.status = .failed;
         self.start_walker();
+        self.maybe_reply_vcs_status();
         try self.loaded(parent);
     } else if (try m.match(.{ tp.any, tp.any, "workspace_path", tp.extract(&value) })) {
         if (self.workspace) |p| self.allocator.free(p);
@@ -1542,7 +1599,7 @@ pub fn process_git(self: *Self, parent: tp.pid_ref, m: tp.message) (OutOfMemoryE
             self.clear_pending_files();
             self.longest_file_path = 0;
             self.state.workspace_files = .running;
-            git.workspace_files(@intFromPtr(self)) catch {
+            vcs.workspace_files(self.vcs_context, self.name) catch {
                 self.state.workspace_files = .failed;
             };
         } else {
@@ -1550,31 +1607,36 @@ pub fn process_git(self: *Self, parent: tp.pid_ref, m: tp.message) (OutOfMemoryE
             // restored MRU entries instead of queueing every tracked path.
             self.state.workspace_files = .done;
         }
+        self.reset_vcs_status_counts();
         self.state.status = .running;
-        git.status(@intFromPtr(self)) catch {
+        vcs.status(self.vcs_context, self.name) catch {
             self.state.status = .failed;
+            self.maybe_reply_vcs_status();
         };
         for (self.new_or_modified_files.items) |file| self.allocator.free(file.path);
         self.new_or_modified_files.clearRetainingCapacity();
         self.state.vcs_new_or_modified_files = .running;
-        git.new_or_modified_files(@intFromPtr(self)) catch {
+        vcs.new_or_modified_files(self.vcs_context, self.name) catch {
             self.state.vcs_new_or_modified_files = .failed;
         };
+        self.maybe_reply_vcs_status();
         try self.loaded(parent);
     } else if (try m.match(.{ tp.any, tp.any, "current_branch", tp.null_ })) {
+        if (self.status.branch) |branch| {
+            self.allocator.free(branch);
+            self.status.branch = null;
+        }
         self.state.current_branch = .done;
+        self.maybe_reply_vcs_status();
         try self.loaded(parent);
     } else if (try m.match(.{ tp.any, tp.any, "current_branch", tp.extract(&value) })) {
         if (self.status.branch) |p| self.allocator.free(p);
         self.status.branch = try self.allocator.dupe(u8, value);
         self.state.current_branch = .done;
+        self.maybe_reply_vcs_status();
         try self.loaded(parent);
     } else if (try m.match(.{ tp.any, tp.any, "workspace_files", tp.extract(&path) })) {
-        var it = std.mem.splitScalar(u8, path, '\n');
-        while (it.next()) |line| {
-            if (line.len == 0) continue;
-            try self.add_pending_owned(convert_path(try self.allocator.dupe(u8, line)));
-        }
+        try self.add_pending_owned(convert_path(try self.allocator.dupe(u8, path)));
     } else if (try m.match(.{ tp.any, tp.any, "workspace_files", tp.null_ })) {
         self.state.workspace_files = .done;
         if (self.load_complete)
@@ -1591,7 +1653,7 @@ pub fn process_git(self: *Self, parent: tp.pid_ref, m: tp.message) (OutOfMemoryE
             .vcs_status = vcs_status,
         };
     } else {
-        self.logger_git.err("git", tp.unexpected(m));
+        self.logger_vcs.err("vcs", tp.unexpected(m));
     }
 }
 
@@ -1601,49 +1663,30 @@ fn process_status(self: *Self, parent: tp.pid_ref, m: tp.message) (OutOfMemoryEr
     const null_ = cbor.null_;
 
     var value: []const u8 = undefined;
-    var ahead: []const u8 = undefined;
-    var behind: []const u8 = undefined;
 
     if (self.state.status == .done)
         self.status.reset(self.allocator);
 
-    if (try m.match(.{ any, any, "status", "#", "branch.oid", extract(&value) })) {
-        // commit | (initial)
-    } else if (try m.match(.{ any, any, "status", "#", "branch.head", extract(&value) })) {
+    if (try m.match(.{ any, any, "status", "branch", extract(&value) })) {
         if (self.status.branch) |p| self.allocator.free(p);
         self.status.branch = try self.allocator.dupe(u8, value);
-    } else if (try m.match(.{ any, any, "status", "#", "branch.upstream", extract(&value) })) {
-        // upstream-branch
-    } else if (try m.match(.{ any, any, "status", "#", "branch.ab", extract(&ahead), extract(&behind) })) {
+    } else if (try m.match(.{ any, any, "status", "ahead", extract(&value) })) {
         if (self.status.ahead) |p| self.allocator.free(p);
-        self.status.ahead = try self.allocator.dupe(u8, ahead);
+        self.status.ahead = try self.allocator.dupe(u8, value);
+    } else if (try m.match(.{ any, any, "status", "behind", extract(&value) })) {
         if (self.status.behind) |p| self.allocator.free(p);
-        self.status.behind = try self.allocator.dupe(u8, behind);
-    } else if (try m.match(.{ any, any, "status", "#", "stash", extract(&value) })) {
+        self.status.behind = try self.allocator.dupe(u8, value);
+    } else if (try m.match(.{ any, any, "status", "stash", extract(&value) })) {
         if (self.status.stash) |p| self.allocator.free(p);
         self.status.stash = try self.allocator.dupe(u8, value);
-    } else if (try m.match(.{ any, any, "status", "1", tp.more })) {
-        // ordinary file: <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>
+    } else if (try m.match(.{ any, any, "status", "changed" })) {
         self.status.changed += 1;
-    } else if (try m.match(.{ any, any, "status", "2", tp.more })) {
-        // rename or copy: <XY> <sub> <mH> <mI> <mW> <hH> <hI> <X><score> <path><sep><origPath>
-        self.status.changed += 1;
-    } else if (try m.match(.{ any, any, "status", "u", tp.more })) {
-        // unmerged file: <XY> <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>
-        self.status.changed += 1;
-    } else if (try m.match(.{ any, any, "status", "?", tp.more })) {
-        // untracked file: <path>
+    } else if (try m.match(.{ any, any, "status", "untracked" })) {
         self.status.untracked += 1;
-    } else if (try m.match(.{ any, any, "status", "!", tp.more })) {
-        // ignored file: <path>
     } else if (try m.match(.{ any, any, "status", null_ })) {
         self.state.status = .done;
+        self.maybe_reply_vcs_status();
         try self.loaded(parent);
-        if (self.status_request) |from| {
-            from.send(.{ "vcs_status", self.status }) catch {};
-            from.deinit();
-            self.status_request = null;
-        }
     }
 }
 
@@ -1655,15 +1698,15 @@ pub fn request_vcs_id(self: *Self, file_path: []const u8) error{OutOfMemory}!voi
     errdefer self.allocator.free(owned_path);
     request.* = .{
         .allocator = self.allocator,
-        .project = @intFromPtr(self),
+        .project = self.vcs_context,
         .file_path = owned_path,
     };
     try self.vcs_id_requests.put(self.allocator, request.file_path, {});
     errdefer _ = self.vcs_id_requests.remove(request.file_path);
-    git.rev_parse(@intFromPtr(request), "HEAD", file_path) catch |e| {
+    vcs.file_id(@intFromPtr(request), self.name, file_path) catch |e| {
         _ = self.vcs_id_requests.remove(request.file_path);
         request.deinit();
-        self.logger_git.print_err("rev-parse", "failed: {t}", .{e});
+        self.logger_vcs.print_err("file-id", "failed: {t}", .{e});
     };
 }
 
@@ -1687,14 +1730,14 @@ pub fn request_vcs_content(self: *Self, parent: tp.pid_ref, file_path: []const u
     errdefer self.allocator.free(owned_id);
     request.* = .{
         .allocator = self.allocator,
-        .project = @intFromPtr(self),
+        .project = self.vcs_context,
         .file_path = owned_path,
         .vcs_id = owned_id,
     };
-    git.cat_file(@intFromPtr(request), vcs_id) catch |e| {
+    vcs.file_content(@intFromPtr(request), self.name, file_path, vcs_id) catch |e| {
         parent.send(.{ "PRJ", "vcs_content", request.file_path, request.vcs_id, null }) catch {};
         request.deinit();
-        self.logger_git.print_err("cat-file", "failed: {t}", .{e});
+        self.logger_vcs.print_err("file-content", "failed: {t}", .{e});
     };
 }
 
@@ -1711,23 +1754,23 @@ pub const VcsContentRequest = struct {
     }
 };
 
-pub fn process_git_response(self: *Self, parent: tp.pid_ref, m: tp.message) (OutOfMemoryError || GitError || error{Exit})!void {
+pub fn process_vcs_response(self: *Self, parent: tp.pid_ref, m: tp.message) (OutOfMemoryError || VcsError || error{Exit})!void {
     var context: usize = undefined;
     var vcs_id: []const u8 = undefined;
     var vcs_content: []const u8 = undefined;
     var blame_output: []const u8 = undefined;
 
-    if (try m.match(.{ tp.any, tp.extract(&context), "rev_parse", tp.extract(&vcs_id) })) {
+    if (try m.match(.{ tp.any, tp.extract(&context), "file_id", tp.extract(&vcs_id) })) {
         const request: *VcsIdRequest = @ptrFromInt(context);
         parent.send(.{ "PRJ", "vcs_id", request.file_path, vcs_id }) catch {};
-    } else if (try m.match(.{ tp.any, tp.extract(&context), "rev_parse", tp.null_ })) {
+    } else if (try m.match(.{ tp.any, tp.extract(&context), "file_id", tp.null_ })) {
         const request: *VcsIdRequest = @ptrFromInt(context);
         _ = self.vcs_id_requests.remove(request.file_path);
         defer request.deinit();
-    } else if (try m.match(.{ tp.any, tp.extract(&context), "cat_file", tp.extract(&vcs_content) })) {
+    } else if (try m.match(.{ tp.any, tp.extract(&context), "file_content", tp.extract(&vcs_content) })) {
         const request: *VcsContentRequest = @ptrFromInt(context);
         parent.send(.{ "PRJ", "vcs_content", request.file_path, request.vcs_id, vcs_content }) catch {};
-    } else if (try m.match(.{ tp.any, tp.extract(&context), "cat_file", tp.null_ })) {
+    } else if (try m.match(.{ tp.any, tp.extract(&context), "file_content", tp.null_ })) {
         const request: *VcsContentRequest = @ptrFromInt(context);
         defer request.deinit();
         parent.send(.{ "PRJ", "vcs_content", request.file_path, request.vcs_id, null }) catch {};
@@ -1748,13 +1791,13 @@ pub fn request_vcs_blame(self: *Self, parent: tp.pid_ref, file_path: []const u8)
     errdefer self.allocator.free(owned_path);
     request.* = .{
         .allocator = self.allocator,
-        .project = @intFromPtr(self),
+        .project = self.vcs_context,
         .file_path = owned_path,
     };
-    git.blame(@intFromPtr(request), file_path) catch |e| {
+    vcs.blame(@intFromPtr(request), self.name, file_path) catch |e| {
         parent.send(.{ "PRJ", "vcs_blame", request.file_path, null }) catch {};
         request.deinit();
-        self.logger_git.print_err("blame", "failed: {t}", .{e});
+        self.logger_vcs.print_err("blame", "failed: {t}", .{e});
     };
 }
 
