@@ -292,7 +292,7 @@ pub fn Create(options: type) type {
 
         fn prepare_resize(self: *Self, padding: Widget.Style.Margin) Widget.Box {
             const screen = tui.screen();
-            const w = self.prepare_width(screen);
+            const w = self.prepare_width(screen, padding);
             return switch (self.placement) {
                 .top_center => self.prepare_resize_top_center(screen, w),
                 .top_left => self.prepare_resize_top_left(screen, w),
@@ -304,7 +304,13 @@ pub fn Create(options: type) type {
             };
         }
 
-        fn prepare_width(self: *Self, screen: Widget.Box) usize {
+        fn prepare_width(self: *Self, screen: Widget.Box, padding: Widget.Style.Margin) usize {
+            // Fixed width palettes: the whole box (including padding) is a fixed
+            // percentage of the screen width, independent of the content size.
+            if (@hasDecl(options, "screen_width_percent")) {
+                const frame_width = screen.w * @min(options.screen_width_percent, 100) / 100;
+                return frame_width -| padding.left -| padding.right;
+            }
             return @min(screen.w -| 2, @max(@min(self.longest + 3, max_list_box_width) + 2 + self.longest_hint, options.label.len + 2));
         }
 
