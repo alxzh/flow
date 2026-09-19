@@ -178,15 +178,15 @@ pub fn status(context_: usize, dir: []const u8) Error!void {
     }.result, log_err, exit_null(tag));
 }
 
-pub fn rev_parse(context_: usize, dir: []const u8, rev: []const u8, file_path: []const u8) Error!void {
+pub fn file_id(context_: usize, dir: []const u8, file_path: []const u8) Error!void {
     const tag = @src().fn_name;
     var arg: std.Io.Writer.Allocating = .init(allocator);
     defer arg.deinit();
     if (file_path.len == 0)
-        try arg.writer.print("{s}", .{rev})
+        try arg.writer.print("HEAD", .{})
     else {
         // <rev>:<path> takes a path relative to the repository root
-        try arg.writer.print("{s}:{s}", .{ rev, relative_to(dir, file_path) });
+        try arg.writer.print("HEAD:{s}", .{relative_to(dir, file_path)});
         if (builtin.os.tag == .windows) std.mem.replaceScalar(u8, arg.written(), '\\', '/');
     }
     try git(context_, dir, .{ "rev-parse", arg.written() }, struct {
@@ -218,9 +218,10 @@ pub fn discover(context_: usize, dir: []const u8) Error!void {
     }.result, exit_result(tag));
 }
 
-pub fn cat_file(context_: usize, dir: []const u8, object: []const u8) Error!void {
+pub fn file_content(context_: usize, dir: []const u8, file_path: []const u8, id: []const u8) Error!void {
+    _ = file_path;
     const tag = @src().fn_name;
-    try git(context_, dir, .{ "cat-file", "-p", object }, struct {
+    try git(context_, dir, .{ "cat-file", "-p", id }, struct {
         fn result(context: usize, parent: tp.pid_ref, output: []const u8) void {
             parent.send(.{ module_name, context, tag, output }) catch {};
         }
@@ -522,7 +523,7 @@ fn get_git() ?[]const u8 {
     git_path_mutex.lockUncancelable(io);
     defer git_path_mutex.unlock(io);
     if (git_path) |p| return p.path;
-    const path = bin_path.find_binary_in_path(allocator, module_name) catch null;
+    const path = bin_path.find_binary_in_path(allocator, git_binary_name) catch null;
     git_path = .{ .path = path };
     return path;
 }
@@ -557,5 +558,6 @@ fn is_file(dir: []const u8, rel_path: []const u8) bool {
     return true;
 }
 
-/// The first field of the messages that git commands send to their caller.
-pub const module_name = @typeName(@This());
+/// Backend-neutral actor namespace; callers only see the VCS facade.
+pub const module_name = "vcs";
+const git_binary_name = "git";
