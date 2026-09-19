@@ -72,6 +72,7 @@ find_in_files_mode: FindMode = .auto,
 find_in_files_filter: FindInFilesFilter = .default,
 initial_find_query: InitialFindQuery = .selection,
 jump_label_alphabet: []const u8 = "abcdefghijklmnopqrstuvwxyz",
+file_finder: ?[]const u8 = null, // external finder executable; null uses the builtin index
 ignore_filter_stderr: bool = false,
 
 auto_run_time_seconds: usize = 120, //seconds
