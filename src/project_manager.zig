@@ -21,6 +21,7 @@ pid: tp.pid_ref,
 const Self = @This();
 const module_name = @typeName(Self);
 const request_timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } };
+var shutdown_requested: std.atomic.Value(bool) = .init(false);
 
 pub const FilePos = Project.FilePos;
 
@@ -46,6 +47,7 @@ fn send(message: anytype) ProjectManagerError!void {
 }
 
 fn create() SpawnError!Self {
+    shutdown_requested.store(false, .release);
     const pid = try Process.create();
     defer pid.deinit();
     tp.env.get().proc_set(module_name, pid.ref());
@@ -61,10 +63,13 @@ pub fn subscribe_lsp_status() ProjectManagerError!void {
 }
 
 pub fn unsubscribe_lsp_status() ProjectManagerError!void {
-    return send(.{"unsubscribe_lsp_status"});
+    const pid = tp.env.get().proc(module_name);
+    if (pid.expired()) return;
+    return pid.send(.{"unsubscribe_lsp_status"}) catch error.ProjectManagerFailed;
 }
 
 pub fn shutdown() void {
+    shutdown_requested.store(true, .release);
     const pid = tp.env.get().proc(module_name);
     if (pid.expired()) {
         tp.self_pid().send(.{ "project_manager", "shutdown" }) catch {};
@@ -465,6 +470,12 @@ const Process = struct {
     }
 
     fn receive(self: *Process, from: tp.pid_ref, m: tp.message) tp.result {
+        if (shutdown_requested.load(.acquire)) {
+            self.shutdown_file_store();
+            self.persist_projects();
+            self.parent.send(.{ "project_manager", "shutdown" }) catch {};
+            return tp.exit_normal();
+        }
         return self.receive_safe(from, m) catch |e| switch (e) {
             error.ExitNormal => tp.exit_normal(),
             error.ClientFailed => {
@@ -635,6 +646,8 @@ const Process = struct {
         } else if (try cbor.match(m.buf, .{ "exit", "error.LspFailed", tp.more })) {
             return;
         } else if (try cbor.match(m.buf, .{ "exit", "error.SendFailed", tp.more })) {
+            return;
+        } else if (try cbor.match(m.buf, .{ "exit", "error.ShutdownTimeout", tp.more })) {
             return;
         } else if (try cbor.match(m.buf, .{ "request_vcs_blame", tp.extract(&project_directory), tp.extract(&path) })) {
             self.request_vcs_blame(from, project_directory, path) catch |e| return from.forward_error(e, @errorReturnTrace()) catch error.ClientFailed;

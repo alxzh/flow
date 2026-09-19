@@ -69,6 +69,7 @@ pub fn widget(self: *Self) Widget {
 }
 
 pub fn deinit(self: *Self, allocator: Allocator) void {
+    self.differ.deinit();
     self.diff_symbols_clear();
     tui.message_filters().remove_ptr(self);
     self.plane.deinit();

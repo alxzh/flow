@@ -157,6 +157,7 @@ pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
     self.bottom_area.deinit();
     if (self.panel_layout_state) |state| allocator.free(state);
     terminal_view.shutdown_all();
+    self.location_history_.deinit();
     self.commands.deinit();
     self.widgets.deinit(allocator);
     self.symbols.deinit(allocator);

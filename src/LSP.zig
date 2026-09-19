@@ -11,6 +11,7 @@ pid: tp.pid,
 const Self = @This();
 const module_name = @typeName(Self);
 const sp_tag = "child";
+const close_timeout_ms = 1_000;
 const debug_lsp = true;
 
 const OutOfMemoryError = error{OutOfMemory};
@@ -182,6 +183,7 @@ const Process = struct {
     log_file_path: ?[]const u8 = null,
     log_file_writer: ?std.Io.File.Writer = null,
     log_file_writer_buf: [1024]u8 = undefined,
+    close_timer: ?tp.timeout = null,
     next_id: i32 = 0,
     requests: std.StringHashMap(tp.pid),
     state: enum { init, running } = .init,
@@ -228,6 +230,11 @@ const Process = struct {
     }
 
     fn deinit(self: *Process) void {
+        if (self.close_timer) |*timer| {
+            timer.cancel() catch {};
+            timer.deinit();
+            self.close_timer = null;
+        }
         self.free_init_queue();
         var i = self.requests.iterator();
         while (i.next()) |req| {
@@ -237,7 +244,7 @@ const Process = struct {
         self.allocator.free(self.sp_tag);
         self.recv_buf.deinit(self.allocator);
         self.allocator.free(self.cmd.buf);
-        self.close() catch {};
+        self.close_subprocess() catch {};
         self.write_log("### terminated LSP process ###\n", .{});
         if (self.log_file) |file| {
             if (self.log_file_writer) |*writer| writer.interface.flush() catch {};
@@ -247,6 +254,12 @@ const Process = struct {
     }
 
     fn close(self: *Process) error{CloseFailed}!void {
+        if (self.sp != null and self.close_timer == null)
+            self.close_timer = tp.timeout.init_ms(close_timeout_ms, tp.message.fmt(.{"close_timeout"})) catch return error.CloseFailed;
+        return self.close_subprocess();
+    }
+
+    fn close_subprocess(self: *Process) error{CloseFailed}!void {
         if (self.sp) |*sp| {
             defer self.sp = null;
             sp.close() catch return error.CloseFailed;
@@ -314,6 +327,7 @@ const Process = struct {
         ExitNormal,
         ExitUnexpected,
         InvalidMapType,
+        ShutdownTimeout,
     });
 
     fn receive_safe(self: *Process, from: tp.pid_ref, m: tp.message) Error!void {
@@ -355,6 +369,9 @@ const Process = struct {
         } else if (try cbor.match(m.buf, .{"term"})) {
             self.write_log("### LSP terminated ###\n", .{});
             try self.term();
+        } else if (try cbor.match(m.buf, .{"close_timeout"})) {
+            self.write_log("### LSP close timed out ###\n", .{});
+            return error.ShutdownTimeout;
         } else if (try cbor.match(m.buf, .{ "set_protocol", tp.extract(&protocol) })) {
             self.write_log("### LSP protcol {t} ###\n", .{protocol});
             self.protocol = protocol;

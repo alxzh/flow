@@ -162,6 +162,8 @@ fn start_watcher(name: []const u8, options: Options) ?file_watcher.Owned {
 
 pub fn deinit(self: *Self) void {
     if (self.watcher) |*watcher| watcher.deinit();
+    if (self.status_request) |from| from.deinit();
+    self.status_request = null;
     self.parent.deinit();
     if (self.walker) |pid| pid.send(.{"stop"}) catch {};
     if (self.ignore) |m| {
@@ -190,10 +192,12 @@ pub fn deinit(self: *Self) void {
     }
     self.lsp_commands.deinit(self.allocator);
     self.lsp_status_subscribers.deinit(self.allocator);
+    self.status.reset(self.allocator);
     for (self.new_or_modified_files.items) |file| self.allocator.free(file.path);
     self.new_or_modified_files.deinit(self.allocator);
     for (self.files.items) |file| self.allocator.free(file.path);
     self.files.deinit(self.allocator);
+    self.clear_pending_files();
     self.pending.deinit(self.allocator);
     self.file_index.deinit(self.allocator);
     if (self.file_store) |*pid| pid.deinit();
@@ -973,6 +977,11 @@ fn safe_posix_read(fd: std.posix.fd_t, buf: []u8) (error{ FileHandleInvalidForRe
 
 fn safe_unexpectedErrno(_: std.posix.system.E) std.posix.UnexpectedError {
     return error.Unexpected;
+}
+
+fn clear_pending_files(self: *Self) void {
+    for (self.pending.items) |file| self.allocator.free(file.path);
+    self.pending.clearRetainingCapacity();
 }
 
 fn merge_pending_files(self: *Self) OutOfMemoryError!void {
