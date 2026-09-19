@@ -1275,12 +1275,63 @@ pub fn build_exe(
         },
     });
 
+    const mercurial_mod = b.createModule(.{
+        .root_source_file = b.path("src/mercurial.zig"),
+        .imports = &.{
+            .{ .name = "thespian", .module = thespian_mod },
+            .{ .name = "cbor", .module = cbor_mod },
+            .{ .name = "shell", .module = shell_mod },
+            .{ .name = "bin_path", .module = bin_path_mod },
+            .{ .name = "soft_root", .module = soft_root_mod },
+        },
+    });
+
     const vcs_mod = b.createModule(.{
         .root_source_file = b.path("src/vcs.zig"),
         .imports = &.{
+            .{ .name = "thespian", .module = thespian_mod },
+            .{ .name = "soft_root", .module = soft_root_mod },
             .{ .name = "git", .module = git_mod },
+            .{ .name = "mercurial", .module = mercurial_mod },
         },
     });
+
+    const vcs_test_run_cmd = blk: {
+        const tests = b.addTest(.{
+            .name = "test-vcs",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/vcs.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+            .filters = test_filters,
+        });
+        tests.root_module.addImport("thespian", thespian_mod);
+        tests.root_module.addImport("soft_root", soft_root_mod);
+        tests.root_module.addImport("git", git_mod);
+        tests.root_module.addImport("mercurial", mercurial_mod);
+        if (install_tests) b.installArtifact(tests);
+        break :blk b.addRunArtifact(tests);
+    };
+
+    const mercurial_test_run_cmd = blk: {
+        const tests = b.addTest(.{
+            .name = "test-mercurial",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/mercurial.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+            .filters = test_filters,
+        });
+        tests.root_module.addImport("thespian", thespian_mod);
+        tests.root_module.addImport("cbor", cbor_mod);
+        tests.root_module.addImport("shell", shell_mod);
+        tests.root_module.addImport("bin_path", bin_path_mod);
+        tests.root_module.addImport("soft_root", soft_root_mod);
+        if (install_tests) b.installArtifact(tests);
+        break :blk b.addRunArtifact(tests);
+    };
 
     const git_test_run_cmd = blk: {
         const tests = b.addTest(.{
@@ -1628,6 +1679,8 @@ pub fn build_exe(
     test_step.dependOn(&double_mapped_ring_buffer_test_run_cmd.step);
     test_step.dependOn(&mouse_event_test_run_cmd.step);
     test_step.dependOn(&syntax_validator_test_run_cmd.step);
+    test_step.dependOn(&vcs_test_run_cmd.step);
+    test_step.dependOn(&mercurial_test_run_cmd.step);
     test_step.dependOn(&git_test_run_cmd.step);
     test_step.dependOn(&external_file_finder_test_run_cmd.step);
     if (stdio_capture_test_run_cmd) |cmd| test_step.dependOn(&cmd.step);

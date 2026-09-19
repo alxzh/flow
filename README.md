@@ -28,6 +28,8 @@ and is my daily driver for almost everything.
 - Hybrid rope/piece-table buffer system, edit **very large files** with
   **thousands of cursors**
 - Infinite **undo** (at least until you run out of ram)
+- Integrated **Git and Mercurial/Sapling** status, changed-file navigation,
+  diff gutter markers, and inline blame
 - Full **unicode** support, including support for the kitty text sizing
   protocol
 - Plenty of **themes** included and support for vscode themes via the
