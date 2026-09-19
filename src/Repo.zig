@@ -4,7 +4,7 @@ const cbor = @import("cbor");
 const log = @import("log");
 const soft_root = @import("soft_root").root;
 const is_directory = soft_root.is_directory;
-const git = @import("git");
+const vcs = @import("vcs");
 const VcsStatus = @import("VcsStatus");
 const file_watcher = @import("file_watcher");
 const gitignore = @import("gitignore");
@@ -15,10 +15,10 @@ const convert_path = LSPClient.convert_path;
 
 allocator: std.mem.Allocator,
 root: []const u8,
-git_dir: []const u8,
-git_common_dir: []const u8,
+vcs_dir: []const u8,
+vcs_common_dir: []const u8,
 superproject: ?[]const u8,
-logger_git: log.Logger,
+logger_vcs: log.Logger,
 
 vcs_status_files: std.ArrayListUnmanaged(VcsStatusFile) = .empty,
 vcs_status_files_next: std.ArrayListUnmanaged(VcsStatusFile) = .empty,
@@ -75,26 +75,26 @@ const VcsStatusFile = struct {
 
 pub const Discovery = struct {
     root: []const u8,
-    git_dir: []const u8,
-    git_common_dir: []const u8,
+    vcs_dir: []const u8,
+    vcs_common_dir: []const u8,
     superproject: ?[]const u8,
 };
 
 pub fn init(allocator: std.mem.Allocator, discovery: Discovery) OutOfMemoryError!Self {
     const root_ = try allocator.dupe(u8, discovery.root);
     errdefer allocator.free(root_);
-    const git_dir = try allocator.dupe(u8, discovery.git_dir);
-    errdefer allocator.free(git_dir);
-    const git_common_dir = try allocator.dupe(u8, discovery.git_common_dir);
-    errdefer allocator.free(git_common_dir);
+    const vcs_dir = try allocator.dupe(u8, discovery.vcs_dir);
+    errdefer allocator.free(vcs_dir);
+    const vcs_common_dir = try allocator.dupe(u8, discovery.vcs_common_dir);
+    errdefer allocator.free(vcs_common_dir);
     const superproject = if (discovery.superproject) |p| try allocator.dupe(u8, p) else null;
     return .{
         .allocator = allocator,
         .root = root_,
-        .git_dir = git_dir,
-        .git_common_dir = git_common_dir,
+        .vcs_dir = vcs_dir,
+        .vcs_common_dir = vcs_common_dir,
         .superproject = superproject,
-        .logger_git = log.logger("git"),
+        .logger_vcs = log.logger("vcs"),
     };
 }
 
@@ -111,10 +111,10 @@ pub fn deinit(self: *Self) void {
     VcsStatusFile.free_all(self.allocator, &self.vcs_status_files_next);
     self.vcs_status_files_next.deinit(self.allocator);
     if (self.superproject) |p| self.allocator.free(p);
-    self.allocator.free(self.git_common_dir);
-    self.allocator.free(self.git_dir);
+    self.allocator.free(self.vcs_common_dir);
+    self.allocator.free(self.vcs_dir);
     self.allocator.free(self.root);
-    self.logger_git.deinit();
+    self.logger_vcs.deinit();
 }
 
 pub fn request_vcs_status_files(self: *Self, from: tp.pid_ref) error{InvalidRequestVcsStatusFilesRequest}!void {
@@ -158,7 +158,7 @@ pub fn refresh_vcs_status(self: *Self) void {
     self.status_next.reset(self.allocator);
     VcsStatusFile.free_all(self.allocator, &self.vcs_status_files_next);
     self.state = .running;
-    git.status(@intFromPtr(self), self.root) catch {
+    vcs.status(@intFromPtr(self), self.root) catch {
         self.state = .failed;
     };
 }
@@ -240,7 +240,7 @@ pub fn vcs_changed_timeout(self: *Self) void {
 }
 
 pub fn owns_vcs_path(self: *const Self, path: []const u8) bool {
-    return is_in_dir(path, self.git_dir) or is_in_dir(path, self.git_common_dir);
+    return is_in_dir(path, self.vcs_dir) or is_in_dir(path, self.vcs_common_dir);
 }
 
 fn is_in_dir(path: []const u8, dir: []const u8) bool {
@@ -255,10 +255,10 @@ fn start_vcs_watcher(self: *Self) void {
         std.log.err("vcs_watcher.init: {s} -> {}", .{ self.root, e });
         return;
     };
-    self.vcs_watch(self.git_dir);
-    if (!std.mem.eql(u8, self.git_common_dir, self.git_dir)) self.vcs_watch(self.git_common_dir);
+    self.vcs_watch(self.vcs_dir);
+    if (!std.mem.eql(u8, self.vcs_common_dir, self.vcs_dir)) self.vcs_watch(self.vcs_common_dir);
     for ([_][]const u8{ "logs/refs", "reftable" }) |rel| {
-        const path = self.nearest_vcs_dir(self.git_common_dir, rel) orelse continue;
+        const path = self.nearest_vcs_dir(self.vcs_common_dir, rel) orelse continue;
         defer self.allocator.free(path);
         self.vcs_watch(path);
     }
@@ -293,19 +293,19 @@ fn nearest_vcs_dir(self: *Self, base: []const u8, rel: []const u8) ?[]const u8 {
     var dir: []const u8 = path;
     while (dir.len > base.len and !is_directory(dir))
         dir = std.fs.path.dirname(dir) orelse return null;
-    if (dir.len <= base.len or self.is_git_dir(dir)) return null;
+    if (dir.len <= base.len or self.is_vcs_dir(dir)) return null;
     return self.allocator.dupe(u8, dir) catch null;
 }
 
-fn is_git_dir(self: *const Self, path: []const u8) bool {
-    return std.mem.eql(u8, path, self.git_dir) or std.mem.eql(u8, path, self.git_common_dir);
+fn is_vcs_dir(self: *const Self, path: []const u8) bool {
+    return std.mem.eql(u8, path, self.vcs_dir) or std.mem.eql(u8, path, self.vcs_common_dir);
 }
 
 fn update_vcs_ref_watches(self: *Self) void {
     if (self.vcs_watcher == null) return;
     const branch = if (self.status.branch) |b| if (std.mem.eql(u8, b, "(detached)")) null else b else null;
-    self.move_vcs_ref_watch(0, self.git_common_dir, "refs/heads", branch);
-    self.move_vcs_ref_watch(1, self.git_common_dir, "refs/remotes", self.status.upstream);
+    self.move_vcs_ref_watch(0, self.vcs_common_dir, "refs/heads", branch);
+    self.move_vcs_ref_watch(1, self.vcs_common_dir, "refs/remotes", self.status.upstream);
 }
 
 fn move_vcs_ref_watch(self: *Self, slot: usize, common_dir: []const u8, prefix: []const u8, ref_name: ?[]const u8) void {
@@ -438,15 +438,22 @@ fn abs_path(self: *const Self, path: []const u8) OutOfMemoryError![]const u8 {
 }
 
 /// file_path is absolute, reply_path is the path the editor asked for
-pub fn request_vcs_id(self: *Self, file_path: []const u8, reply_path: []const u8) OutOfMemoryError!void {
+pub fn request_vcs_id(self: *Self, file_path: []const u8, reply_path: []const u8) vcs.Error!void {
     const request = try self.allocator.create(VcsIdRequest);
+    const owned_path = self.allocator.dupe(u8, reply_path) catch |e| {
+        self.allocator.destroy(request);
+        return e;
+    };
     request.* = .{
         .allocator = self.allocator,
         .repo = @intFromPtr(self),
-        .file_path = try self.allocator.dupe(u8, reply_path),
+        .file_path = owned_path,
     };
-    git.rev_parse(@intFromPtr(request), self.root, "HEAD", file_path) catch |e|
-        self.logger_git.print_err("rev-parse", "failed: {t}", .{e});
+    vcs.file_id(@intFromPtr(request), self.root, file_path) catch |e| {
+        request.deinit();
+        self.logger_vcs.print_err("file-id", "failed: {t}", .{e});
+        return e;
+    };
 }
 
 pub const VcsIdRequest = struct {
@@ -461,16 +468,28 @@ pub const VcsIdRequest = struct {
     }
 };
 
-pub fn request_vcs_content(self: *Self, file_path: []const u8, vcs_id: []const u8) OutOfMemoryError!void {
+pub fn request_vcs_content(self: *Self, file_path: []const u8, vcs_id: []const u8) vcs.Error!void {
     const request = try self.allocator.create(VcsContentRequest);
+    const owned_path = self.allocator.dupe(u8, file_path) catch |e| {
+        self.allocator.destroy(request);
+        return e;
+    };
+    const owned_id = self.allocator.dupe(u8, vcs_id) catch |e| {
+        self.allocator.free(owned_path);
+        self.allocator.destroy(request);
+        return e;
+    };
     request.* = .{
         .allocator = self.allocator,
         .repo = @intFromPtr(self),
-        .file_path = try self.allocator.dupe(u8, file_path),
-        .vcs_id = try self.allocator.dupe(u8, vcs_id),
+        .file_path = owned_path,
+        .vcs_id = owned_id,
     };
-    git.cat_file(@intFromPtr(request), self.root, vcs_id) catch |e|
-        self.logger_git.print_err("cat-file", "failed: {t}", .{e});
+    vcs.file_content(@intFromPtr(request), self.root, file_path, vcs_id) catch |e| {
+        request.deinit();
+        self.logger_vcs.print_err("file-content", "failed: {t}", .{e});
+        return e;
+    };
 }
 
 pub const VcsContentRequest = struct {
@@ -486,15 +505,20 @@ pub const VcsContentRequest = struct {
     }
 };
 
-pub fn request_vcs_first_change(self: *Self, file_path: []const u8, staged: bool) OutOfMemoryError!void {
+pub fn request_vcs_first_change(self: *Self, parent: tp.pid_ref, file_path: []const u8, staged: bool) OutOfMemoryError!void {
     const request = try self.allocator.create(VcsFirstChangeRequest);
+    const owned_path = self.allocator.dupe(u8, file_path) catch |e| {
+        self.allocator.destroy(request);
+        return e;
+    };
     request.* = .{
         .allocator = self.allocator,
         .repo = @intFromPtr(self),
-        .file_path = try self.allocator.dupe(u8, file_path),
+        .file_path = owned_path,
     };
-    git.first_change(@intFromPtr(request), self.root, staged, file_path) catch |e| {
-        self.logger_git.print_err("diff", "failed: {t}", .{e});
+    vcs.first_change(@intFromPtr(request), self.root, staged, file_path) catch |e| {
+        self.logger_vcs.print_err("diff", "failed: {t}", .{e});
+        parent.send(.{ "PRJ", "vcs_first_change", request.file_path, null }) catch {};
         request.deinit();
     };
 }
@@ -511,18 +535,23 @@ pub const VcsFirstChangeRequest = struct {
     }
 };
 
-pub const VcsDiffMode = git.DiffMode;
+pub const VcsDiffMode = vcs.DiffMode;
 
-pub fn request_vcs_diff(self: *Self, file_path: []const u8, orig_path: []const u8, mode: VcsDiffMode, context_lines: usize) OutOfMemoryError!void {
+pub fn request_vcs_diff(self: *Self, parent: tp.pid_ref, file_path: []const u8, orig_path: []const u8, mode: VcsDiffMode, context_lines: usize) OutOfMemoryError!void {
     const request = try self.allocator.create(VcsDiffRequest);
+    const owned_path = self.allocator.dupe(u8, file_path) catch |e| {
+        self.allocator.destroy(request);
+        return e;
+    };
     request.* = .{
         .allocator = self.allocator,
         .repo = @intFromPtr(self),
-        .file_path = try self.allocator.dupe(u8, file_path),
+        .file_path = owned_path,
         .mode = mode,
     };
-    git.diff(@intFromPtr(request), self.root, mode, file_path, orig_path, context_lines) catch |e| {
-        self.logger_git.print_err("diff", "failed: {t}", .{e});
+    vcs.diff(@intFromPtr(request), self.root, mode, file_path, orig_path, context_lines) catch |e| {
+        self.logger_vcs.print_err("diff", "failed: {t}", .{e});
+        parent.send(.{ "PRJ", "vcs_diff", request.file_path, request.mode, request.output.items }) catch {};
         request.deinit();
     };
 }
@@ -543,32 +572,34 @@ pub const VcsDiffRequest = struct {
 
 pub const VcsIndexUpdate = enum { stage, unstage, revert };
 
-pub fn request_vcs_update_index(self: *Self, update: VcsIndexUpdate, file_paths: []const []const u8) OutOfMemoryError!void {
+pub fn request_vcs_update_index(self: *Self, parent: tp.pid_ref, update: VcsIndexUpdate, file_paths: []const []const u8) OutOfMemoryError!void {
     const request = try self.allocator.create(VcsIndexUpdateRequest);
     request.* = .{ .allocator = self.allocator, .repo = @intFromPtr(self) };
     const initial = if (self.status.commit) |commit| std.mem.eql(u8, commit, "(initial)") else false;
-    const git_update: git.IndexUpdate = switch (update) {
+    const vcs_update: vcs.IndexUpdate = switch (update) {
         .stage => .stage,
         .unstage => if (initial) .unstage_initial else .unstage,
         .revert => .revert,
     };
-    git.update_index(@intFromPtr(request), self.root, git_update, file_paths) catch |e| {
-        self.logger_git.print_err("update-index", "failed: {t}", .{e});
+    vcs.update_index(@intFromPtr(request), self.root, vcs_update, file_paths) catch |e| {
+        self.logger_vcs.print_err("update-index", "failed: {t}", .{e});
         request.deinit();
+        parent.send(.{ "PRJ", "vcs_update_index_done", @as(i64, 1) }) catch {};
     };
 }
 
-pub fn request_vcs_apply_patch(self: *Self, update: VcsIndexUpdate, patch: []const u8) OutOfMemoryError!void {
+pub fn request_vcs_apply_patch(self: *Self, parent: tp.pid_ref, update: VcsIndexUpdate, patch: []const u8) OutOfMemoryError!void {
     const request = try self.allocator.create(VcsIndexUpdateRequest);
     request.* = .{ .allocator = self.allocator, .repo = @intFromPtr(self) };
-    const git_update: git.IndexUpdate = switch (update) {
+    const vcs_update: vcs.IndexUpdate = switch (update) {
         .stage => .stage,
         .unstage => .unstage,
         .revert => .revert,
     };
-    git.apply_patch(@intFromPtr(request), self.root, git_update, patch) catch |e| {
-        self.logger_git.print_err("apply", "failed: {t}", .{e});
+    vcs.apply_patch(@intFromPtr(request), self.root, vcs_update, patch) catch |e| {
+        self.logger_vcs.print_err("apply", "failed: {t}", .{e});
         request.deinit();
+        parent.send(.{ "PRJ", "vcs_update_index_done", @as(i64, 1) }) catch {};
     };
 }
 
@@ -586,13 +617,17 @@ pub const VcsFileState = enum { unversioned, modified, clean };
 /// file_path is absolute
 pub fn request_vcs_file_state(self: *Self, from: tp.pid_ref, id: usize, file_path: []const u8) OutOfMemoryError!void {
     const request = try self.allocator.create(VcsFileStateRequest);
+    const owned_path = self.allocator.dupe(u8, file_path) catch |e| {
+        self.allocator.destroy(request);
+        return e;
+    };
     request.* = .{
         .allocator = self.allocator,
         .repo = @intFromPtr(self),
         .id = id,
-        .file_path = try self.allocator.dupe(u8, file_path),
+        .file_path = owned_path,
     };
-    git.ls_tree(@intFromPtr(request), self.root, "HEAD", request.file_path) catch request.done(from);
+    vcs.ls_tree(@intFromPtr(request), self.root, "HEAD", request.file_path) catch request.done(from);
 }
 
 pub const VcsFileStateRequest = struct {
@@ -609,7 +644,7 @@ pub const VcsFileStateRequest = struct {
     }
 };
 
-pub fn process_git_response(self: *Self, parent: tp.pid_ref, m: tp.message) (OutOfMemoryError || error{Exit})!void {
+pub fn process_vcs_response(self: *Self, parent: tp.pid_ref, m: tp.message) (OutOfMemoryError || error{Exit})!void {
     var context: usize = undefined;
     var vcs_id: []const u8 = undefined;
     var vcs_content: []const u8 = undefined;
@@ -617,18 +652,18 @@ pub fn process_git_response(self: *Self, parent: tp.pid_ref, m: tp.message) (Out
     var exit_code: i64 = undefined;
     var diff_output: []const u8 = undefined;
 
-    if (try m.match(.{ tp.any, tp.extract(&context), "rev_parse", tp.extract(&vcs_id) })) {
+    if (try m.match(.{ tp.any, tp.extract(&context), "file_id", tp.extract(&vcs_id) })) {
         const request: *VcsIdRequest = @ptrFromInt(context);
         request.found = true;
         parent.send(.{ "PRJ", "vcs_id", request.file_path, vcs_id }) catch {};
-    } else if (try m.match(.{ tp.any, tp.extract(&context), "rev_parse", tp.null_ })) {
+    } else if (try m.match(.{ tp.any, tp.extract(&context), "file_id", tp.null_ })) {
         const request: *VcsIdRequest = @ptrFromInt(context);
         defer request.deinit();
         if (!request.found) parent.send(.{ "PRJ", "vcs_id", request.file_path, null }) catch {};
-    } else if (try m.match(.{ tp.any, tp.extract(&context), "cat_file", tp.extract(&vcs_content) })) {
+    } else if (try m.match(.{ tp.any, tp.extract(&context), "file_content", tp.extract(&vcs_content) })) {
         const request: *VcsContentRequest = @ptrFromInt(context);
         parent.send(.{ "PRJ", "vcs_content", request.file_path, request.vcs_id, vcs_content }) catch {};
-    } else if (try m.match(.{ tp.any, tp.extract(&context), "cat_file", tp.null_ })) {
+    } else if (try m.match(.{ tp.any, tp.extract(&context), "file_content", tp.null_ })) {
         const request: *VcsContentRequest = @ptrFromInt(context);
         defer request.deinit();
         parent.send(.{ "PRJ", "vcs_content", request.file_path, request.vcs_id, null }) catch {};
@@ -638,7 +673,7 @@ pub fn process_git_response(self: *Self, parent: tp.pid_ref, m: tp.message) (Out
     } else if (try m.match(.{ tp.any, tp.extract(&context), "ls_tree", tp.null_ })) {
         const request: *VcsFileStateRequest = @ptrFromInt(context);
         if (request.state == .unversioned) return request.done(parent);
-        git.file_status(context, self.root, request.file_path) catch {
+        vcs.file_status(context, self.root, request.file_path) catch {
             request.state = .modified;
             request.done(parent);
         };

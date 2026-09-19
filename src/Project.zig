@@ -4,7 +4,7 @@ const cbor = @import("cbor");
 const EditSet = @import("EditSet");
 const log = @import("log");
 const root = @import("soft_root").root;
-const git = @import("git");
+const vcs = @import("vcs");
 const file_type_config = @import("file_type_config");
 const file_link = @import("file_link");
 const Buffer = @import("Buffer");
@@ -39,7 +39,7 @@ tasks: std.ArrayList(Task),
 persistent: bool = false,
 logger: log.Logger,
 logger_lsp: log.Logger,
-logger_git: log.Logger,
+logger_vcs: log.Logger,
 last_used: i128,
 parent: tp.pid,
 
@@ -65,7 +65,7 @@ pub const RequestError = error{
 } || OutOfMemoryError || cbor.Error;
 pub const StartLspError = LSPClient.StartLspError;
 pub const LspError = LSPClient.LspError;
-pub const GitError = error{InvalidGitResponse};
+pub const VcsError = error{InvalidVcsResponse};
 pub const LspInfoError = LSPClient.LspInfoError;
 
 pub const FilePos = RecentFiles.FilePos;
@@ -93,7 +93,7 @@ pub fn init(allocator: std.mem.Allocator, name: []const u8, parent: tp.pid_ref, 
         .tasks = .empty,
         .logger = log.logger("project"),
         .logger_lsp = log.logger("lsp"),
-        .logger_git = log.logger("git"),
+        .logger_vcs = log.logger("vcs"),
         .last_used = @as(i128, now.toNanoseconds()),
         .parent = parent.clone(),
     };
@@ -139,7 +139,7 @@ pub fn deinit(self: *Self) void {
     for (self.tasks.items) |task| self.allocator.free(task.command);
     self.tasks.deinit(self.allocator);
     self.logger_lsp.deinit();
-    self.logger_git.deinit();
+    self.logger_vcs.deinit();
     self.logger.deinit();
     self.allocator.free(self.name);
 }
@@ -1148,7 +1148,7 @@ pub fn sync_file_finder(self: *Self) void {
     self.finder.sync() catch {};
 }
 
-pub fn process_git_response(_: *Self, parent: tp.pid_ref, m: tp.message) (OutOfMemoryError || GitError || error{Exit})!void {
+pub fn process_vcs_response(_: *Self, parent: tp.pid_ref, m: tp.message) (OutOfMemoryError || VcsError || error{Exit})!void {
     var context: usize = undefined;
     var blame_output: []const u8 = undefined;
 
@@ -1166,12 +1166,6 @@ pub const VcsDiffMode = Repo.VcsDiffMode;
 pub const VcsIndexUpdate = Repo.VcsIndexUpdate;
 pub const VcsFileState = Repo.VcsFileState;
 
-/// editor paths are relative to the project
-fn abs_path(self: *const Self, file_path: []const u8) error{OutOfMemory}![]const u8 {
-    if (std.fs.path.isAbsolute(file_path)) return self.allocator.dupe(u8, file_path);
-    return std.fs.path.join(self.allocator, &.{ self.name, file_path });
-}
-
 pub fn request_vcs_blame(self: *Self, parent: tp.pid_ref, file_path: []const u8) error{OutOfMemory}!void {
     const request = try self.allocator.create(VcsBlameRequest);
     errdefer self.allocator.destroy(request);
@@ -1182,12 +1176,10 @@ pub fn request_vcs_blame(self: *Self, parent: tp.pid_ref, file_path: []const u8)
         .project = @intFromPtr(self),
         .file_path = owned_path,
     };
-    const path = try self.abs_path(file_path);
-    defer self.allocator.free(path);
-    git.blame(@intFromPtr(request), path) catch |e| {
+    vcs.blame(@intFromPtr(request), self.name, file_path) catch |e| {
         parent.send(.{ "PRJ", "vcs_blame", request.file_path, null }) catch {};
         request.deinit();
-        self.logger_git.print_err("blame", "failed: {t}", .{e});
+        self.logger_vcs.print_err("blame", "failed: {t}", .{e});
     };
 }
 
