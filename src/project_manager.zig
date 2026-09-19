@@ -14,6 +14,7 @@ const file_link = @import("file_link");
 const builtin = @import("builtin");
 
 const Project = @import("Project.zig");
+const vcs = @import("vcs");
 const external_file_finder = @import("external_file_finder.zig");
 pub const SourceLocation = Project.SourceLocation;
 
@@ -561,6 +562,22 @@ const Process = struct {
             } else if (try cbor.match(m.buf, .{ tp.any, tp.any, tp.any, tp.null_ })) {
                 request.deinit();
             }
+        } else if (try cbor.match(m.buf, .{ "vcs", tp.extract(&context), "blame_nodes", tp.more })) {
+            vcs.handle_blame_nodes(context, m);
+        } else if (try cbor.match(m.buf, .{ "vcs", tp.extract(&context), "blame_meta", tp.more })) {
+            vcs.handle_blame_meta(context, m);
+        } else if (try cbor.match(m.buf, .{ "vcs", tp.extract(&context), "status_files", tp.more })) {
+            vcs.handle_status_files(context, m);
+        } else if (try cbor.match(m.buf, .{ "vcs", tp.extract(&context), "status_shelves", tp.more })) {
+            vcs.handle_status_shelves(context, m);
+        } else if (try cbor.match(m.buf, .{ "vcs", tp.extract(&context), "workspace_files_tracked", tp.more })) {
+            vcs.handle_tracked_files(context, m);
+        } else if (try cbor.match(m.buf, .{ "vcs", tp.extract(&context), "workspace_files_unknown", tp.more })) {
+            vcs.handle_unknown_files(context, m);
+        } else if (try cbor.match(m.buf, .{ "vcs", tp.extract(&context), "check_ignore_out", tp.more })) {
+            vcs.handle_ignore_output(context, m);
+        } else if (try cbor.match(m.buf, .{ "vcs", tp.extract(&context), "check_ignore_done", tp.more })) {
+            vcs.handle_ignore_done(context);
         } else if (try cbor.match(m.buf, .{ "vcs", tp.extract(&context), "blame", tp.more })) {
             const request: *Project.VcsBlameRequest = @ptrFromInt(context);
             if (self.project_from_ref(request.project)) |project| {
