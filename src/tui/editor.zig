@@ -321,6 +321,11 @@ pub const Editor = struct {
         word,
         line,
     };
+    const VimPastePlacement = enum {
+        cursor,
+        before,
+        after,
+    };
     const Self = @This();
     pub const Target = Self;
 
@@ -3381,6 +3386,51 @@ pub const Editor = struct {
         return root_;
     }
 
+    fn write_vim_linewise_paste_text(writer: *std.Io.Writer, text: []const u8, placement: VimPastePlacement) !void {
+        var content_end = text.len;
+        if (content_end > 0 and text[content_end - 1] == '\n') {
+            content_end -= 1;
+            if (content_end > 0 and text[content_end - 1] == '\r') content_end -= 1;
+        }
+        switch (placement) {
+            .before => {
+                try writer.writeAll(text[0..content_end]);
+                try writer.writeByte('\n');
+            },
+            .after => {
+                try writer.writeByte('\n');
+                try writer.writeAll(text[0..content_end]);
+            },
+            .cursor => unreachable,
+        }
+    }
+
+    fn insert_linewise_vim(self: *Self, root: Buffer.Root, cursel: *CurSel, text: []const u8, allocator: Allocator, placement: VimPastePlacement) !Buffer.Root {
+        var root_ = if (cursel.selection) |_| try self.delete_selection(root, cursel, allocator) else root;
+        const cursor = &cursel.cursor;
+        switch (placement) {
+            .before => try move_cursor_begin(root_, cursor, self.metrics),
+            .after => try move_cursor_end(root_, cursor, self.metrics),
+            .cursor => unreachable,
+        }
+        const begin = cursor.*;
+
+        var paste_text: std.Io.Writer.Allocating = .init(self.allocator);
+        defer paste_text.deinit();
+        try write_vim_linewise_paste_text(&paste_text.writer, text, placement);
+
+        var end = Cursor{};
+        end.row, end.col, root_ = try root_.insert_chars(cursor.row, cursor.col, paste_text.written(), allocator, self.metrics);
+        end.target = end.col;
+        self.nudge_insert(.{ .begin = begin, .end = end }, cursel, paste_text.written().len);
+
+        cursor.* = begin;
+        if (placement == .after) cursor.row += 1;
+        cursor.col = 0;
+        cursor.target = 0;
+        return root_;
+    }
+
     pub fn cut_to(self: *Self, move: cursor_operator_const, root_: Buffer.Root) !Buffer.Root {
         var all_stop = true;
         var root = root_;
@@ -3403,8 +3453,24 @@ pub const Editor = struct {
         return if (all_stop) error.Stop else root;
     }
 
+    fn add_linewise_clipboard_chunk(text: []const u8, append_newline: bool) !void {
+        if (!tui.config().vim_linewise_paste or (!append_newline and text.len > 0 and text[text.len - 1] == '\n')) {
+            tui.clipboard_add_linewise_chunk(text);
+            return;
+        }
+
+        const allocator = tui.clipboard_allocator();
+        errdefer allocator.free(text);
+        const normalized = try allocator.alloc(u8, text.len + 1);
+        @memcpy(normalized[0..text.len], text);
+        normalized[text.len] = '\n';
+        allocator.free(text);
+        tui.clipboard_add_linewise_chunk(normalized);
+    }
+
     pub fn cut_internal_vim(self: *Self, ctx: Context) Result {
         const primary = self.get_primary();
+        const had_selection = primary.selection != null;
         const b = self.buf_for_update() catch return;
         var root = b.root;
         tui.clipboard_start_group();
@@ -3412,7 +3478,7 @@ pub const Editor = struct {
             try self.select_line_at_cursor(root, primary, .include_eol);
         for (self.cursels.items) |*cursel_| if (cursel_.*) |*cursel| {
             const cut_text, root = try self.cut_selection(root, cursel, tui.clipboard_allocator());
-            tui.clipboard_add_chunk(cut_text);
+            try add_linewise_clipboard_chunk(cut_text, had_selection);
         };
         try self.update_buf(root, ctx.now);
         self.clamp(ctx.now);
@@ -3621,6 +3687,7 @@ pub const Editor = struct {
 
     pub fn copy_line_internal_vim(self: *Self, _: Context) Result {
         const primary = self.get_primary();
+        const had_selection = primary.selection != null;
         const root = self.buf_root() catch return;
         if (primary.selection) |_| {} else {
             const sel = primary.enable_selection(root, self.metrics);
@@ -3629,8 +3696,18 @@ pub const Editor = struct {
             try move_cursor_right(root, &sel.end, self.metrics);
         }
         tui.clipboard_start_group();
-        for (self.cursels.items) |*cursel_| if (cursel_.*) |*cursel| if (cursel.selection) |sel|
-            tui.clipboard_add_chunk(try copy_selection(root, sel, tui.clipboard_allocator(), self.metrics));
+        for (self.cursels.items) |*cursel_| if (cursel_.*) |*cursel| if (cursel.selection) |sel| {
+            var line_sel = sel;
+            if (tui.config().vim_linewise_paste and had_selection) {
+                line_sel.normalize();
+                try move_cursor_begin(root, &line_sel.begin, self.metrics);
+                try move_cursor_end(root, &line_sel.end, self.metrics);
+            }
+            try add_linewise_clipboard_chunk(
+                try copy_selection(root, line_sel, tui.clipboard_allocator(), self.metrics),
+                had_selection,
+            );
+        };
     }
     pub const copy_line_internal_vim_meta: Meta = .{ .description = "Copy line to internal clipboard (vim)" };
 
@@ -3685,7 +3762,7 @@ pub const Editor = struct {
     }
     pub const paste_meta: Meta = .{ .description = "Paste from internal clipboard", .arguments = &.{.integer} };
 
-    pub fn paste_internal_vim(self: *Self, ctx: Context) Result {
+    fn paste_internal_vim_at(self: *Self, ctx: Context, placement: VimPastePlacement) Result {
         var text_: []const u8 = undefined;
         const clipboard: []const tui.ClipboardEntry = if (ctx.args.buf.len > 0 and try ctx.args.match(.{tp.extract(&text_)}))
             &[_]tui.ClipboardEntry{.{ .text = text_ }}
@@ -3697,6 +3774,7 @@ pub const Editor = struct {
             return;
         }
 
+        const effective_placement = if (tui.config().vim_linewise_paste) placement else .cursor;
         const b = try self.buf_for_update();
         var root = b.root;
 
@@ -3706,10 +3784,13 @@ pub const Editor = struct {
         while (true) {
             const cursel_ = &self.cursels.items[cursel_idx];
             if (cursel_.*) |*cursel| {
-                const text = clipboard[idx].text;
-                root = try self.insert_line_vim(root, cursel, text, b.allocator);
+                const item = clipboard[idx];
+                root = if (item.linewise and effective_placement != .cursor)
+                    try self.insert_linewise_vim(root, cursel, item.text, b.allocator, effective_placement)
+                else
+                    try self.insert_line_vim(root, cursel, item.text, b.allocator);
                 idx = if (idx == 0) clipboard.len - 1 else idx - 1;
-                bytes += text.len;
+                bytes += item.text.len;
             }
             if (cursel_idx == 0) break;
             cursel_idx -= 1;
@@ -3720,7 +3801,21 @@ pub const Editor = struct {
         self.clamp(ctx.now);
         self.need_render();
     }
+
+    pub fn paste_internal_vim(self: *Self, ctx: Context) Result {
+        return self.paste_internal_vim_at(ctx, .cursor);
+    }
     pub const paste_internal_vim_meta: Meta = .{ .description = "Paste from internal clipboard (vim)" };
+
+    pub fn paste_internal_vim_after(self: *Self, ctx: Context) Result {
+        return self.paste_internal_vim_at(ctx, .after);
+    }
+    pub const paste_internal_vim_after_meta: Meta = .{ .description = "Paste from internal clipboard using Vim p placement" };
+
+    pub fn paste_internal_vim_before(self: *Self, ctx: Context) Result {
+        return self.paste_internal_vim_at(ctx, .before);
+    }
+    pub const paste_internal_vim_before_meta: Meta = .{ .description = "Paste from internal clipboard using Vim P placement" };
 
     pub fn delete_forward(self: *Self, ctx: Context) Result {
         const b = try self.buf_for_update();
@@ -8024,6 +8119,28 @@ pub const Editor = struct {
         self.last = .{};
     }
 };
+
+test "vim linewise paste text" {
+    const Case = struct {
+        placement: Editor.VimPastePlacement,
+        input: []const u8,
+        expected: []const u8,
+    };
+    const cases = [_]Case{
+        .{ .placement = .after, .input = "one\ntwo", .expected = "\none\ntwo" },
+        .{ .placement = .after, .input = "one\ntwo\n", .expected = "\none\ntwo" },
+        .{ .placement = .before, .input = "one\ntwo\n", .expected = "one\ntwo\n" },
+        .{ .placement = .before, .input = "one\r\n", .expected = "one\n" },
+        .{ .placement = .after, .input = "\n", .expected = "\n" },
+    };
+
+    for (cases) |case| {
+        var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer output.deinit();
+        try Editor.write_vim_linewise_paste_text(&output.writer, case.input, case.placement);
+        try std.testing.expectEqualStrings(case.expected, output.written());
+    }
+}
 
 pub fn create(allocator: Allocator, parent: Plane, buffer_manager: *Buffer.Manager, now: std.Io.Timestamp) !Widget {
     return EditorWidget.create(allocator, parent, buffer_manager, now);

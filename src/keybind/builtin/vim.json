@@ -180,8 +180,8 @@
             ["D", "cut_to_end_vim"],
             ["Y", ["copy_line_internal_vim"], ["cancel"]],
             ["yy", ["copy_line_internal_vim"], ["cancel"]],
-            ["p", "paste_internal_vim"],
-            ["P", "paste_internal_vim"],
+            ["p", "paste_internal_vim_after"],
+            ["P", "paste_internal_vim_before"],
 
             ["yiw", ["copy_inside_word"], ["cancel"]],
             ["yi(", ["copy_inside_parentheses"], ["cancel"]],

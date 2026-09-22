@@ -135,6 +135,7 @@ pub const PaletteType = enum {
 pub const ClipboardEntry = struct {
     text: []const u8 = &.{},
     group: usize = 0,
+    linewise: bool = false,
 };
 
 const ClipboardForward = struct {
@@ -3256,6 +3257,14 @@ pub fn clipboard_clear_all() void {
 }
 
 pub fn clipboard_add_chunk(text: []const u8) void {
+    clipboard_add_chunk_internal(text, false);
+}
+
+pub fn clipboard_add_linewise_chunk(text: []const u8) void {
+    clipboard_add_chunk_internal(text, true);
+}
+
+fn clipboard_add_chunk_internal(text: []const u8, linewise: bool) void {
     const self = current();
     const clipboard = if (self.clipboard) |*clipboard| clipboard else blk: {
         self.clipboard = .empty;
@@ -3264,6 +3273,7 @@ pub fn clipboard_add_chunk(text: []const u8) void {
     const chunk = clipboard.addOne(self.allocator) catch @panic("OOM clipboard_add_chunk");
     chunk.text = text;
     chunk.group = self.clipboard_current_group_number;
+    chunk.linewise = linewise;
 }
 
 fn clipboard_system_clipboard_text(allocator: std.mem.Allocator) error{ Stop, WriteFailed, OutOfMemory }![]const u8 {

@@ -2625,9 +2625,10 @@ pub fn write_state(self: *Self, writer: *std.Io.Writer) WriteStateError!void {
     if (tui.clipboard_get_history()) |clipboard| {
         try cbor.writeArrayHeader(writer, clipboard.len);
         for (clipboard) |item| {
-            try cbor.writeArrayHeader(writer, 2);
+            try cbor.writeArrayHeader(writer, 3);
             try cbor.writeValue(writer, item.group);
             try cbor.writeValue(writer, item.text);
+            try cbor.writeValue(writer, item.linewise);
         }
     } else {
         try cbor.writeValue(writer, null);
@@ -2713,14 +2714,21 @@ fn extract_state(self: *Self, iter: *[]const u8, mode: enum { no_project, with_p
     const clipboard_allocator = tui.clipboard_allocator();
     while (len > 0) : (len -= 1) {
         const len_ = try cbor.decodeArrayHeader(iter);
-        if (len_ != 2) return error.MatchClipboardArrayFailed;
+        if (len_ != 2 and len_ != 3) return error.MatchClipboardArrayFailed;
         var group: usize = 0;
         var text: []const u8 = undefined;
+        var linewise = false;
         if (!try cbor.matchValue(iter, cbor.extract(&group))) return error.MatchClipboardGroupFailed;
         if (!try cbor.matchValue(iter, cbor.extract(&text))) return error.MatchClipboardTextFailed;
+        if (len_ == 3)
+            if (!try cbor.matchValue(iter, cbor.extract(&linewise))) return error.MatchClipboardArrayFailed;
         if (prev_group != group) tui.clipboard_start_group();
         prev_group = group;
-        tui.clipboard_add_chunk(try clipboard_allocator.dupe(u8, text));
+        const owned_text = try clipboard_allocator.dupe(u8, text);
+        if (linewise)
+            tui.clipboard_add_linewise_chunk(owned_text)
+        else
+            tui.clipboard_add_chunk(owned_text);
     }
     logger.print("restored clipboard ({d} bytes)", .{prev_len - iter.len});
 
