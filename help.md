@@ -178,6 +178,10 @@ more advanced vim functions (e.g. macros and registers) are not supported
 (yet). Keybindings from flow mode that do not conflict with vim keybindings
 also work in vim mode.
 
+Set `vim_linewise_paste true` in the configuration to make normal-mode `p`
+and `P` put linewise yanks after and before the current line, respectively.
+It defaults to `false` to preserve the previous paste behavior.
+
 ### Helix mode
 
 The helix modes, shown as NOR, INS or SEL in the status bar, follow the
