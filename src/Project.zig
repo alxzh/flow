@@ -165,6 +165,8 @@ fn start_watcher(name: []const u8, options: Options) ?file_watcher.Owned {
 
 pub fn deinit(self: *Self) void {
     if (self.watcher) |*watcher| watcher.deinit();
+    if (self.status_request) |from| from.deinit();
+    self.status_request = null;
     self.parent.deinit();
     if (self.walker) |pid| pid.send(.{"stop"}) catch {};
     if (self.ignore) |m| {
@@ -193,10 +195,12 @@ pub fn deinit(self: *Self) void {
     }
     self.lsp_commands.deinit(self.allocator);
     self.lsp_status_subscribers.deinit(self.allocator);
+    self.status.reset(self.allocator);
     for (self.new_or_modified_files.items) |file| self.allocator.free(file.path);
     self.new_or_modified_files.deinit(self.allocator);
     for (self.files.items) |file| self.allocator.free(file.path);
     self.files.deinit(self.allocator);
+    for (self.pending.items) |file| self.allocator.free(file.path);
     self.pending.deinit(self.allocator);
     self.file_index.deinit(self.allocator);
     if (self.file_store) |*pid| pid.deinit();
