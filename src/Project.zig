@@ -871,7 +871,7 @@ fn default_ft() struct { []const u8, []const u8, u24 } {
 
 pub fn guess_path_file_type(path: []const u8, file_name: []const u8) struct { []const u8, []const u8, u24 } {
     var buf: [4096]u8 = undefined;
-    const file_path = std.fmt.bufPrint(&buf, "{s}{}{s}", .{ path, std.fs.path.sep, file_name }) catch return default_ft();
+    const file_path = std.fmt.bufPrint(&buf, "{s}{c}{s}", .{ path, std.fs.path.sep, file_name }) catch return default_ft();
     return guess_file_type(file_path);
 }
 
