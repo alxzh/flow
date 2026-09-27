@@ -978,17 +978,52 @@ fn safe_unexpectedErrno(_: std.posix.system.E) std.posix.UnexpectedError {
     return error.Unexpected;
 }
 
-fn merge_pending_files(self: *Self) OutOfMemoryError!void {
-    defer self.sort_files_by_mtime();
+fn clear_pending_files(self: *Self) void {
+    for (self.pending.items) |file| self.allocator.free(file.path);
+    self.pending.clearRetainingCapacity();
+}
+
+/// What to do with known files that are missing from a new enumeration. The
+/// initial load keeps them all, as they are restored or already opened files.
+/// A re-sync keeps only visited ones, so deleted files leave the index.
+const UnlistedFiles = enum { keep_all, keep_visited };
+
+fn merge_pending_files(self: *Self, unlisted: UnlistedFiles) OutOfMemoryError!void {
+    // Index the freshly enumerated paths once. Re-sync can contain hundreds
+    // of thousands of files, so carrying MRU state must be linear rather
+    // than scanning the new list once per existing file.
+    var by_path: std.StringHashMapUnmanaged(usize) = .empty;
+    defer by_path.deinit(self.allocator);
+    for (self.pending.items, 0..) |file, i|
+        try by_path.put(self.allocator, file.path, i);
+
+    var carry_count: usize = 0;
+    for (self.files.items) |file| {
+        if ((unlisted == .keep_all or file.visited) and !by_path.contains(file.path))
+            carry_count += 1;
+    }
+    try self.pending.ensureTotalCapacity(self.allocator, self.pending.items.len + carry_count);
+
     const existing = try self.files.toOwnedSlice(self.allocator);
     defer self.allocator.free(existing);
     self.files = self.pending;
     self.pending = .empty;
 
-    for (existing) |*file| {
-        self.update_mru_internal(&.{ .src = .{ .path = file.path, .line = file.pos.row, .column = file.pos.col } }, file.mtime) catch {};
-        self.allocator.free(file.path);
+    for (existing) |file| {
+        if (by_path.get(file.path)) |i| {
+            // Keep the freshly enumerated entry, but carry over its MRU state.
+            self.files.items[i].mtime = file.mtime;
+            self.files.items[i].pos = file.pos;
+            self.files.items[i].visited = file.visited;
+            self.allocator.free(file.path);
+        } else if (unlisted == .keep_all or file.visited) {
+            self.files.appendAssumeCapacity(file);
+            self.longest_file_path = @max(self.longest_file_path, file.path.len);
+        } else {
+            self.allocator.free(file.path);
+        }
     }
+    self.sort_files_by_mtime();
 }
 
 fn loaded(self: *Self, parent: tp.pid_ref) OutOfMemoryError!void {
@@ -1004,7 +1039,7 @@ fn loaded(self: *Self, parent: tp.pid_ref) OutOfMemoryError!void {
         if (self.state.workspace_files == .done) "tracked" else "walked",
     });
 
-    try self.merge_pending_files();
+    try self.merge_pending_files(.keep_all);
     self.queue_all_mtimes();
     self.logger.print("opened: {s} with {d} files in {d} ms", .{
         self.name,
@@ -1489,6 +1524,7 @@ pub fn unsupported_lsp_request(self: *Self, from: tp.pid_ref, cbor_id: []const u
 pub const GetLineOfFileError = LSPClient.GetLineOfFileError;
 
 pub fn query_git(self: *Self) void {
+    if (self.state.workspace_path == .running or self.state.workspace_files == .running) return;
     self.state.workspace_path = .running;
     git.workspace_path(@intFromPtr(self)) catch {
         self.state.workspace_path = .failed;
@@ -1587,6 +1623,8 @@ pub fn process_git(self: *Self, parent: tp.pid_ref, m: tp.message) (OutOfMemoryE
         self.workspace = convert_path(try self.allocator.dupe(u8, value));
         self.state.workspace_path = .done;
         if (self.index_workspace_files) {
+            self.clear_pending_files();
+            self.longest_file_path = 0;
             self.state.workspace_files = .running;
             git.workspace_files(@intFromPtr(self)) catch {
                 self.state.workspace_files = .failed;
@@ -1622,7 +1660,10 @@ pub fn process_git(self: *Self, parent: tp.pid_ref, m: tp.message) (OutOfMemoryE
         }
     } else if (try m.match(.{ tp.any, tp.any, "workspace_files", tp.null_ })) {
         self.state.workspace_files = .done;
-        try self.loaded(parent);
+        if (self.load_complete)
+            try self.merge_pending_files(.keep_visited)
+        else
+            try self.loaded(parent);
     } else if (try m.match(.{ tp.any, tp.any, "new_or_modified_files", tp.null_ })) {
         self.state.vcs_new_or_modified_files = .done;
         try self.loaded(parent);
